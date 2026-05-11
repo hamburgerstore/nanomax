@@ -174,9 +174,14 @@
                             </StackPanel>
                             <StackPanel Orientation="Horizontal" Margin="0,5,15,5">
                                 <TextBlock Text="원 회전 속도 (XY) 자동계산:" VerticalAlignment="Center" Margin="0,0,5,0"/>
-                                <TextBox x:Name="inCircleVel" Width="90" VerticalAlignment="Center" PreviewTextInput="TextBox_PreviewTextInput" Background="#FFF0F8FF" ToolTip="Z속도와 파라미터로부터 자동계산됩니다.&#xD;&#xA;직접 수정도 가능합니다."/>
+                                <TextBox x:Name="inCircleVel" Width="90" VerticalAlignment="Center" PreviewTextInput="TextBox_PreviewTextInput" TextChanged="HelixInput_TextChanged" Background="#FFF0F8FF" ToolTip="Z속도와 파라미터로부터 자동계산됩니다.&#xD;&#xA;직접 수정도 가능합니다."/>
                                 <TextBlock x:Name="unitCircleVel" Text="mm/s" VerticalAlignment="Center" Margin="2,0,5,0" Foreground="Gray"/>
                                 <TextBlock Text="(직접 수정 가능)" VerticalAlignment="Center" Foreground="Gray" FontSize="11" Margin="0,0,5,0"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Horizontal" Margin="0,5,15,5">
+                                <TextBlock Text="총 선속도 (3D):" VerticalAlignment="Center" FontWeight="Bold" Foreground="Blue" Margin="0,0,5,0"/>
+                                <TextBlock x:Name="txtCircleTotalVel" Text="0.0000" VerticalAlignment="Center" FontWeight="Bold" Foreground="Blue"/>
+                                <TextBlock Text="mm/s" VerticalAlignment="Center" Margin="2,0,0,0" Foreground="Gray"/>
                             </StackPanel>
                             <Button x:Name="btnDrawCircle" Content="나선(Helix) 그리기 시작" Width="140" Height="25" Margin="0,5,0,5" Background="#FFD4EDD4" VerticalAlignment="Center" Click="btnDrawCircle_Click"/>
                         </WrapPanel>

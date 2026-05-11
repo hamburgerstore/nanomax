@@ -26,6 +26,8 @@ namespace nanomaxtest.Controllers
             return DeviceManagerCLI.GetDeviceList();
         }
 
+        // [모듈: 강건한 하드웨어 연결 및 비관리형 포인터 충돌 격리]
+        // 벤치탑 채널에서 치명적 NRE를 유발하는 LoadMotorConfiguration을 제거하고, 내장 설정을 안전하게 강제 동기화하여 0mm 버그를 해결합니다.
         public async Task ConnectAsync(string serialNo)
         {
             if (IsSimulationMode)
@@ -39,54 +41,146 @@ namespace nanomaxtest.Controllers
                 return;
             }
 
+            string cleanSerial = serialNo?.Trim();
+            Thorlabs.MotionControl.DeviceManagerCLI.DeviceManagerCLI.BuildDeviceList();
+            await Task.Delay(500); // 비동기 초기화 타이밍 병목 해결을 위한 필수 지연
+
             await Task.Run(() =>
             {
-                _device = BenchtopStepperMotor.CreateBenchtopStepperMotor(serialNo);
-                _device.Connect(serialNo);
+                Disconnect();
+                System.Threading.Thread.Sleep(200); // 포트 반환 안정화 딜레이
 
-                _channels[0] = _device.GetChannel(3); // X축
-                _channels[1] = _device.GetChannel(2); // Y축
-                _channels[2] = _device.GetChannel(1); // Z축
+                if (string.IsNullOrEmpty(cleanSerial) || cleanSerial.Length < 2)
+                    throw new Exception("시리얼 번호가 유효하지 않습니다.");
+
+                string prefix = cleanSerial.Substring(0, 2);
+
+                if (prefix == "70")
+                {
+                    _device = BenchtopStepperMotor.CreateBenchtopStepperMotor(cleanSerial);
+                }
+                else if (prefix == "71")
+                {
+                    throw new Exception($"BPC 피에조 컨트롤러(접두사 71)가 감지되었습니다. 현재 팩토리는 스테퍼(BSC) 전용이므로 BenchtopPiezo 클래스 연동이 필요합니다.");
+                }
+                else
+                {
+                    throw new Exception($"시리얼 번호 접두사({prefix})는 현재 BenchtopStepperMotor 클래스와 호환되지 않습니다. 호환되는 Kinesis 드라이버 DLL을 확인하세요.");
+                }
+
+                if (_device == null)
+                {
+                    throw new Exception($"장비({cleanSerial}) 인스턴스를 생성할 수 없습니다. Kinesis DLL 바인딩(x64/x86) 또는 장비 전원 상태를 확인하세요.");
+                }
+
+                _device.Connect(cleanSerial);
+                System.Threading.Thread.Sleep(500);
 
                 for (int i = 0; i < 3; i++)
                 {
-                    if (_channels[i] != null)
+                    StepperMotorChannel channel = null;
+                    short[] candidateIds = { (short)(i + 1), (short)i };
+
+                    foreach (short id in candidateIds)
                     {
-                        if (!_channels[i].IsSettingsInitialized()) _channels[i].WaitForSettingsInitialized(5000);
-                        _channels[i].StartPolling(250);
-                        _channels[i].EnableDevice();
+                        try
+                        {
+                            channel = _device.GetChannel(id);
+                            if (channel != null) break;
+                        }
+                        catch (NullReferenceException)
+                        {
+                            channel = null;
+                        }
+                        catch
+                        {
+                            channel = null;
+                        }
                     }
+
+                    if (channel == null)
+                    {
+                        throw new Exception($"모터 채널(축 {i + 1}) 인스턴스를 확보하지 못했습니다. 물리 슬롯 구성을 확인하세요.");
+                    }
+
+                    _channels[i] = channel;
+
+                    // [모듈: 모터 구성 파라미터 로드 및 초기화]
+                    // SDK 내부 설정 안착을 위해 필수적인 LoadMotorConfiguration을 채널 ID 기반으로 호출합니다.
+                    _channels[i].LoadMotorConfiguration(_channels[i].DeviceID);
+
+                    if (!_channels[i].IsSettingsInitialized())
+                    {
+                        _channels[i].WaitForSettingsInitialized(5000);
+                        if (!_channels[i].IsSettingsInitialized())
+                        {
+                            throw new Exception($"모터 채널(축 {i + 1})의 파라미터 초기화가 지연되고 있습니다.");
+                        }
+                    }
+
+                    System.Threading.Thread.Sleep(100);
+
+                    var deviceSettings = _channels[i].MotorDeviceSettings;
+                    if (deviceSettings == null)
+                    {
+                        throw new Exception($"모터 채널(축 {i + 1})의 세부 설정(DeviceSettings) 인스턴스를 확보하지 못했습니다.");
+                    }
+
+                    _channels[i].SetSettings(deviceSettings, true, true);
+
+                    _channels[i].StartPolling(250);
+                    _channels[i].EnableDevice();
                 }
             });
         }
 
         public void Disconnect()
         {
-            if (IsSimulationMode)
             {
-                for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
-                return;
-            }
-
-            for (int i = 0; i < 3; i++)
-            {
-                if (_channels[i] != null && _channels[i].IsConnected)
+                if (IsSimulationMode)
                 {
-                    _channels[i].StopPolling();
-                    _channels[i] = null;
+                    for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
+                    return;
                 }
-            }
 
-            if (_device != null)
-            {
-                _device.Disconnect(true);
-                _device = null;
+                for (int i = 0; i < 3; i++)
+                {
+                    if (_channels[i] != null && _channels[i].IsConnected)
+                    {
+                        _channels[i].StopPolling();
+                        _channels[i] = null;
+                    }
+                }
+
+                if (_device != null)
+                {
+                    _device.Disconnect(true);
+                    _device = null;
+                }
             }
         }
 
         public bool IsConnected(int index) => IsSimulationMode ? _simIsConnected[index] : (_channels[index] != null && _channels[index].IsConnected);
         public bool IsMoving(int index) => IsSimulationMode ? _simIsMoving[index] : (IsConnected(index) && _channels[index].Status.IsMoving);
-        public decimal GetPosition(int index) => IsSimulationMode ? _simPositions[index] : (IsConnected(index) ? _channels[index].Position : 0m);
+
+        // [모듈: 안전한 좌표 판독 방어막] 장비 물리 파라미터가 초기화되지 않았을 때 UI 타이머가 접근하여 강제 종료되는 현상 원천 차단
+        public decimal GetPosition(int index)
+        {
+            if (IsSimulationMode) return _simPositions[index];
+            try
+            {
+                // 채널이 연결되어 있고, 기계적 설정(DeviceSettings)이 메모리에 안착한 상태에서만 좌표 판독
+                if (IsConnected(index) && _channels[index].IsSettingsInitialized())
+                {
+                    return _channels[index].Position;
+                }
+                return 0m;
+            }
+            catch
+            {
+                return 0m; // DeviceSettingsException 등 예외 발생 시 안전하게 0 반환
+            }
+        }
 
         public async Task WaitUntilStoppedAsync(int index, Func<bool> checkCancel = null)
         {

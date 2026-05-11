@@ -108,7 +108,7 @@ namespace nanomaxtest.Managers
                     CurrentMacroIndex = i; // [모듈: 버그 수정] 현재 진행 인덱스를 갱신하여 UI 시간 표시 연동 복구
 
                     Task moveTask = Task.CompletedTask;
-                    if (cmd.AxisName == "WAIT") 
+                    if (cmd.AxisName == "WAIT")
                     {
                         moveTask = Task.Run(async () =>
                         {

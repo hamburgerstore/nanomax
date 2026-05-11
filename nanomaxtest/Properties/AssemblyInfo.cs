@@ -7,12 +7,12 @@ using System.Windows;
 // 어셈블리에 대한 일반 정보는 다음 특성 집합을 통해 
 // 제어됩니다. 어셈블리와 관련된 정보를 수정하려면
 // 이러한 특성 값을 변경하세요.
-[assembly: AssemblyTitle("nanomaxtest")]
-[assembly: AssemblyDescription("")]
+[assembly: AssemblyTitle("NanoMax 300 Controller")]
+[assembly: AssemblyDescription("정밀 3축 제어 및 MGP 공정 자동화 시스템")]
 [assembly: AssemblyConfiguration("")]
-[assembly: AssemblyCompany("")]
-[assembly: AssemblyProduct("nanomaxtest")]
-[assembly: AssemblyCopyright("Copyright ©  2026")]
+[assembly: AssemblyCompany("AMG Lab")]
+[assembly: AssemblyProduct("NanoMax 300 Automation System")]
+[assembly: AssemblyCopyright("Copyright © 2026 Hallym Univ. AMG Lab. All rights reserved.")]
 [assembly: AssemblyTrademark("")]
 [assembly: AssemblyCulture("")]
 

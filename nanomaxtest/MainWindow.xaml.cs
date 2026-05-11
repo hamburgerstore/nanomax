@@ -611,21 +611,44 @@ namespace nanomaxtest
 
         private void HelixInput_TextChanged(object sender, TextChangedEventArgs e) => UpdateCalcXYVel();
 
+        // [모듈: 헬릭스 3차원 총 선속도 실시간 연산 및 UI 연동]
+        // 기존 엔진 연산을 유지하면서, 도출된 XY 회전 속도와 Z축 상승 속도의 피타고라스 벡터 합성을 통해 3D 선속도를 실시간 출력합니다.
         private void UpdateCalcXYVel()
         {
-            if (inCircleVel == null) return;
+            if (inCircleVel == null || txtCircleTotalVel == null) return;
+
+            double vZ = 0;
+            double.TryParse(inCircleZVel?.Text, out vZ);
+
             if (double.TryParse(inCircleDiameter.Text, out double d) && double.TryParse(inCircleZDist.Text, out double zDistPerTurn) &&
-                double.TryParse(inCircleZVel.Text, out double vZ) && int.TryParse(inCircleSteps.Text, out int steps) && int.TryParse(inCircleLoops.Text, out int loops))
+                vZ > 0 && int.TryParse(inCircleSteps.Text, out int steps) && int.TryParse(inCircleLoops.Text, out int loops))
             {
                 double vXY = _engine.CalculateHelixVelocity(d, zDistPerTurn, vZ, steps, loops);
                 if (vXY > 0)
                 {
-                    inCircleVel.Text = vXY.ToString("0.########");
+                    // 이벤트 무한 루프 방지를 위해, 현재 텍스트와 다를 때만 덮어씀
+                    string newVxyStr = vXY.ToString("0.########");
+                    if (inCircleVel.Text != newVxyStr)
+                    {
+                        inCircleVel.Text = newVxyStr;
+                    }
                     inCircleVel.Background = new SolidColorBrush(Color.FromRgb(0xF0, 0xF8, 0xFF));
-                    return;
+                }
+                else
+                {
+                    inCircleVel.Background = Brushes.White;
                 }
             }
-            inCircleVel.Background = Brushes.White;
+            else
+            {
+                inCircleVel.Background = Brushes.White;
+            }
+
+            // 최종 3차원 합성 선속도 V_total = sqrt(v_xy^2 + v_z^2) 계산 및 출력
+            double currentVxy = 0;
+            double.TryParse(inCircleVel.Text, out currentVxy);
+            double totalVel = System.Math.Sqrt(currentVxy * currentVxy + vZ * vZ);
+            txtCircleTotalVel.Text = totalVel.ToString("0.0000");
         }
 
         private async void btnDrawCircle_Click(object sender, RoutedEventArgs e)

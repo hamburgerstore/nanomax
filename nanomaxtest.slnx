@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+  </Configurations>
+  <Project Path="nanomaxtest/nanomaxtest.csproj" Id="7ec10eca-c741-4235-ad8d-4d9252626266">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
+</Solution>

@@ -1,0 +1,228 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Thorlabs.MotionControl.DeviceManagerCLI;
+using Thorlabs.MotionControl.Benchtop.StepperMotorCLI;
+using Thorlabs.MotionControl.GenericMotorCLI;
+using Thorlabs.MotionControl.GenericMotorCLI.AdvancedMotor;
+
+namespace nanomaxtest.Controllers
+{
+    public class DeviceController
+    {
+        public bool IsSimulationMode { get; set; } = false;
+
+        private bool[] _simIsConnected = new bool[3];
+        private decimal[] _simPositions = new decimal[3];
+        private bool[] _simIsMoving = new bool[3];
+
+        private BenchtopStepperMotor _device;
+        private StepperMotorChannel[] _channels = new StepperMotorChannel[3];
+
+        public IList<string> GetDeviceList()
+        {
+            if (IsSimulationMode) return new List<string> { "99999999 (가상 장비 시뮬레이터)" };
+            DeviceManagerCLI.BuildDeviceList();
+            return DeviceManagerCLI.GetDeviceList();
+        }
+
+        public async Task ConnectAsync(string serialNo)
+        {
+            if (IsSimulationMode)
+            {
+                for (int i = 0; i < 3; i++)
+                {
+                    _simIsConnected[i] = true;
+                    _simPositions[i] = 0m;
+                    _simIsMoving[i] = false;
+                }
+                return;
+            }
+
+            await Task.Run(() =>
+            {
+                _device = BenchtopStepperMotor.CreateBenchtopStepperMotor(serialNo);
+                _device.Connect(serialNo);
+
+                _channels[0] = _device.GetChannel(3); // X축
+                _channels[1] = _device.GetChannel(2); // Y축
+                _channels[2] = _device.GetChannel(1); // Z축
+
+                for (int i = 0; i < 3; i++)
+                {
+                    if (_channels[i] != null)
+                    {
+                        if (!_channels[i].IsSettingsInitialized()) _channels[i].WaitForSettingsInitialized(5000);
+                        _channels[i].StartPolling(250);
+                        _channels[i].EnableDevice();
+                    }
+                }
+            });
+        }
+
+        public void Disconnect()
+        {
+            if (IsSimulationMode)
+            {
+                for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
+                return;
+            }
+
+            for (int i = 0; i < 3; i++)
+            {
+                if (_channels[i] != null && _channels[i].IsConnected)
+                {
+                    _channels[i].StopPolling();
+                    _channels[i] = null;
+                }
+            }
+
+            if (_device != null)
+            {
+                _device.Disconnect(true);
+                _device = null;
+            }
+        }
+
+        public bool IsConnected(int index) => IsSimulationMode ? _simIsConnected[index] : (_channels[index] != null && _channels[index].IsConnected);
+        public bool IsMoving(int index) => IsSimulationMode ? _simIsMoving[index] : (IsConnected(index) && _channels[index].Status.IsMoving);
+        public decimal GetPosition(int index) => IsSimulationMode ? _simPositions[index] : (IsConnected(index) ? _channels[index].Position : 0m);
+
+        public async Task WaitUntilStoppedAsync(int index, Func<bool> checkCancel = null)
+        {
+            if (!IsConnected(index)) return;
+
+            if (IsSimulationMode)
+            {
+                while (_simIsMoving[index])
+                {
+                    if (checkCancel != null && checkCancel()) break;
+                    await Task.Delay(50);
+                }
+                return;
+            }
+
+            int stopConfirmCount = 0;
+            while (true)
+            {
+                if (checkCancel != null && checkCancel()) break;
+
+                if (!_channels[index].Status.IsMoving)
+                {
+                    stopConfirmCount++;
+                    if (stopConfirmCount >= 3) break;
+                }
+                else stopConfirmCount = 0;
+
+                await Task.Delay(50);
+            }
+        }
+
+        public async Task HomeAsync(int index)
+        {
+            if (!IsConnected(index)) return;
+
+            if (IsSimulationMode)
+            {
+                _simIsMoving[index] = true;
+                await Task.Delay(1000);
+                _simPositions[index] = 0m;
+                _simIsMoving[index] = false;
+                return;
+            }
+
+            await Task.Run(() => _channels[index].Home(60000000));
+        }
+
+        public void StopProfiled(int index)
+        {
+            if (IsConnected(index))
+            {
+                if (IsSimulationMode) _simIsMoving[index] = false;
+                // [완벽 해결] SDK의 Action<ulong> 요구사항에 맞춰 빈 람다 함수 전달
+                else _channels[index].Stop(t => { });
+            }
+        }
+
+        public void StopImmediate(int index)
+        {
+            if (IsConnected(index))
+            {
+                if (IsSimulationMode) _simIsMoving[index] = false;
+                else _channels[index].StopImmediate();
+            }
+        }
+
+        public async Task MoveAbsoluteAsync(int index, decimal targetPos, decimal targetVel, decimal targetAcc, bool ignoreIsMoving = false)
+        {
+            if (!IsConnected(index)) return;
+            if (!ignoreIsMoving && IsMoving(index)) return;
+
+            if (IsSimulationMode)
+            {
+                _simIsMoving[index] = true;
+                decimal startPos = _simPositions[index];
+                decimal dist = Math.Abs(targetPos - startPos);
+                int delayMs = targetVel > 0 ? (int)((dist / targetVel) * 1000) : 0;
+
+                _ = Task.Run(async () =>
+                {
+                    int steps = delayMs / 50;
+                    if (steps > 0)
+                    {
+                        for (int i = 1; i <= steps; i++)
+                        {
+                            if (!_simIsMoving[index]) break;
+                            await Task.Delay(50);
+                            _simPositions[index] = startPos + (targetPos - startPos) * ((decimal)i / steps);
+                        }
+                    }
+                    if (_simIsMoving[index]) _simPositions[index] = targetPos;
+                    _simIsMoving[index] = false;
+                });
+                return;
+            }
+
+            decimal safeAcc = Math.Min(targetAcc, 2.0m);
+            decimal safeVel = Math.Min(targetVel, 1.5m);
+
+            await Task.Run(() =>
+            {
+                if (ignoreIsMoving && _channels[index].Status.IsMoving)
+                {
+                    // [완벽 해결]
+                    _channels[index].Stop(t => { });
+                    System.Threading.Thread.Sleep(50);
+                }
+
+                _channels[index].SetVelocityParams(safeVel, safeAcc);
+                _channels[index].SetMoveAbsolutePosition(targetPos);
+                _channels[index].MoveAbsolute(60000000);
+
+                if (index != 2) _channels[index].DisableDevice();
+            });
+        }
+
+        public void StartJog(int index, double velocityPercentage)
+        {
+            if (!IsConnected(index) || velocityPercentage == 0)
+            {
+                StopImmediate(index);
+                return;
+            }
+
+            if (IsSimulationMode)
+            {
+                _simIsMoving[index] = true;
+                return;
+            }
+
+            decimal maxVel = 2.0m;
+            decimal jogVel = (decimal)(Math.Abs(velocityPercentage) / 100.0) * maxVel;
+            if (jogVel < 0.1m) jogVel = 0.1m;
+
+            _channels[index].SetVelocityParams(jogVel, 1.0m);
+            _channels[index].MoveContinuous(velocityPercentage > 0 ? MotorDirection.Forward : MotorDirection.Backward);
+        }
+    }
+}

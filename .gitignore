@@ -1,0 +1,11 @@
+# Visual Studio 로컬 캐시 폴더 (에러 원인)
+.vs/
+
+# 빌드 결과물 폴더
+[Bb]in/
+[Oo]bj/
+
+# 기타 사용자 설정 파일
+*.user
+*.suo
+*.log

@@ -206,8 +206,8 @@
                             <DataGridTextColumn Header="순서" Binding="{Binding Index}" IsReadOnly="True" Width="50"/>
                             <DataGridTextColumn Header="축" Binding="{Binding AxisName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="50"/>
                             <DataGridTextColumn Header="모드" Binding="{Binding Mode, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="50"/>
-                            <DataGridTextColumn Header="좌표/거리/시간" Binding="{Binding Target, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, StringFormat={}{0:0.########}}" Width="120"/>
-                            <DataGridTextColumn Header="속도" Binding="{Binding Velocity, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged, StringFormat={}{0:0.########}}" Width="90"/>
+                            <DataGridTextColumn Header="좌표/거리/시간" Binding="{Binding Target, Mode=TwoWay, UpdateSourceTrigger=LostFocus, StringFormat={}{0:0.########}}" Width="120"/>
+                            <DataGridTextColumn Header="속도" Binding="{Binding Velocity, Mode=TwoWay, UpdateSourceTrigger=LostFocus, StringFormat={}{0:0.########}}" Width="90"/>
                             <DataGridCheckBoxColumn Header="동시 실행" Binding="{Binding IsSync, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="70"/>
                             <DataGridTextColumn Header="예상 시간" Binding="{Binding EstimatedTime, StringFormat={}{0:F1}s}" IsReadOnly="True" Width="80"/>
                             <DataGridTextColumn Header="남은 시간" Binding="{Binding RemainingTime, StringFormat={}{0:F1}s}" IsReadOnly="True" Width="80"/>

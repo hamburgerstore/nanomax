@@ -50,8 +50,16 @@ namespace nanomaxtest.Models
         private double _remainingTime;
         public double RemainingTime { get => _remainingTime; set { _remainingTime = value; OnPropertyChanged(nameof(RemainingTime)); } }
 
+        // 동기 배치 합산 시 중복 계산을 막는 실제 기여 시간
+        public double BillingTime { get; set; }
+
         private string _syncSummary;
         public string SyncSummary { get => _syncSummary; set { _syncSummary = value; OnPropertyChanged(nameof(SyncSummary)); } }
+
+        // [모듈: 재개 시 정합성 보장] 매크로 실행 시작 시 결정된 절대 목표 좌표를 저장
+        public double RuntimeAbsoluteTarget { get; set; }
+
+        public bool HasRuntimeTarget { get; set; }
     }
 
     public class ArrayPoint : ObservableObject

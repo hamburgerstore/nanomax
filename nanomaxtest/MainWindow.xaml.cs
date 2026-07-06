@@ -36,7 +36,28 @@ namespace nanomaxtest
         private decimal?[,] _waypoints = new decimal?[5, 3];
         private List<string> _actionLog = new List<string>();
 
+        // [모듈: 실시간 이동 경로 레코딩 변수] 주기적 위치 샘플링 및 저장을 위한 상태 및 데이터 버퍼
+        private bool _isRecording = false;
+        private List<MacroCommand> _recordedPath = new List<MacroCommand>();
+        private double[] _lastRecordedPos = new double[3];
+        private DateTime[] _lastRecordedTime = new DateTime[3];
+        // [모듈: 입력값 보존 버퍼] 직접 입력한 거리와 속도를 저장하여 역산 오차를 방지하고 중단 여부를 추적합니다.
+        private double[] _plannedDist = new double[3];
+        private double[] _plannedVel = new double[3];
+        private bool[] _isInterrupted = new bool[3];
+        private bool[] _isDirectMoving = new bool[3];
+        // [모듈: 남은 시간 정밀 추적 변수] 통신 딜레이나 역산 오차에 흔들리지 않도록 절대 도달 예정 시각을 기록합니다.
+        private DateTime[] _targetEndTime = new DateTime[3];
+        // [모듈: 타겟 이동 식별 플래그] 조그와 입력 이동을 구분하여 시간 계산 간섭을 방지합니다.
+        private bool[] _hasTargetTime = new bool[3];
+        private DateTime[] _targetIssuedAt = new DateTime[3];
+        private bool[] _seenMovingAfterCommand = new bool[3];
+        private bool _isFaulted = false;
+        private readonly object _recordLock = new object();
+        private bool _activePollingMode = false;
+
         private string _appDataPath;
+
         private string _presetFilePath;
         private string _settingsFilePath;
 
@@ -58,7 +79,9 @@ namespace nanomaxtest
 
             _sequenceManager = new nanomaxtest.Managers.TaskSequenceManager(_deviceController, _engine);
             _sequenceManager.NotificationRequested += SendNotification;
+            _deviceController.SafetyLog = msg => LogAction("SafetyGate", msg, "-", "-");
             dgMacro.ItemsSource = _sequenceManager.MacroSequence;
+
 
             _sequenceManager.ArrayPoints.Add(new ArrayPoint { AxisPos = 0, ZPos = 0 });
             dgArrayPoints.ItemsSource = _sequenceManager.ArrayPoints;
@@ -153,13 +176,47 @@ namespace nanomaxtest
             catch { }
         }
 
-        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e) => MessageBox.Show($"전역 에러:\n{e.ExceptionObject}", "종료 원인", MessageBoxButton.OK, MessageBoxImage.Error);
+        private void CurrentDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+        {
+            EnterFault(nameof(CurrentDomain_UnhandledException), e.ExceptionObject as Exception ?? new Exception(e.ExceptionObject?.ToString()));
+        }
 
+        private void EnterFault(string where, Exception ex)
+        {
+            if (_isFaulted) return;
+            _isFaulted = true;
+
+            try
+            {
+                _sequenceManager?.StopAll();
+                for (int i = 0; i < 3; i++) _deviceController?.StopProfiled(i);
+            }
+            catch { }
+
+            Dispatcher.Invoke(() =>
+            {
+                btnConnect.IsEnabled = false;
+                btnStartMacro.IsEnabled = false;
+                btnStartArray.IsEnabled = false;
+                txtGlobalStatus.Text = "FAULT 상태";
+                txtGlobalStatus.Foreground = Brushes.Red;
+                MessageBox.Show($"{where} 예외로 안전 정지되었습니다.\n{ex.Message}", "FAULT", MessageBoxButton.OK, MessageBoxImage.Error);
+            });
+        }
+
+        private readonly object _logLock = new object();
         private void LogAction(string axis, string action, string distance, string velocity)
+
         {
             string time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
-            _actionLog.Add($"{time},{axis},{action},{distance},{velocity}");
-            Dispatcher.InvokeAsync(() => { if (txtLogCount != null) txtLogCount.Text = $"현재 기록된 로그 수: {_actionLog.Count - 1}개"; });
+            int currentCount = 0;
+            // [모듈 수정: 멀티스레드 충돌 및 IndexOutOfRange 방지] 동시 다발적인 비동기 태스크가 List<T>에 접근할 때 발생하는 데이터 손상을 락(Lock)으로 완벽히 격리
+            lock (_logLock)
+            {
+                _actionLog.Add($"{time},{axis},{action},{distance},{velocity}");
+                currentCount = _actionLog.Count - 1;
+            }
+            Dispatcher.InvokeAsync(() => { if (txtLogCount != null) txtLogCount.Text = $"현재 기록된 로그 수: {currentCount}개"; });
         }
 
         private static readonly HttpClient _httpClient = new HttpClient();
@@ -338,12 +395,12 @@ namespace nanomaxtest
 
         private async void btnConnect_Click(object sender, RoutedEventArgs e)
         {
-            if (cmbSerialNo.SelectedItem == null) return;
-            btnConnect.IsEnabled = false; btnSearch.IsEnabled = false;
-            txtGlobalStatus.Text = "연결 중..."; txtGlobalStatus.Foreground = Brushes.Orange;
-
             try
             {
+                if (cmbSerialNo.SelectedItem == null) return;
+                btnConnect.IsEnabled = false; btnSearch.IsEnabled = false;
+                txtGlobalStatus.Text = "연결 중..."; txtGlobalStatus.Foreground = Brushes.Orange;
+
                 await _deviceController.ConnectAsync(cmbSerialNo.SelectedItem.ToString());
                 txtGlobalStatus.Text = "연결 성공 및 채널 활성화됨"; txtGlobalStatus.Foreground = Brushes.Blue;
                 btnDisconnect.IsEnabled = true; btnSearch.IsEnabled = true;
@@ -352,11 +409,10 @@ namespace nanomaxtest
             }
             catch (Exception ex)
             {
-                txtGlobalStatus.Text = "연결 실패"; txtGlobalStatus.Foreground = Brushes.Red;
-                btnConnect.IsEnabled = true; btnSearch.IsEnabled = true;
-                MessageBox.Show($"연결 실패:\n{ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error);
+                EnterFault(nameof(btnConnect_Click), ex);
             }
         }
+
 
         private void btnDisconnect_Click(object sender, RoutedEventArgs e)
         {
@@ -381,11 +437,87 @@ namespace nanomaxtest
             UpdateAxisUI(1, ctrlY.txtPos, ctrlY.txtStatus, ctrlY.txtTime, ctrlY.btnHome, ctrlY.btnMinus, ctrlY.btnPlus, ctrlY.btnGo, ctrlY.btnStop);
             UpdateAxisUI(2, ctrlZ.txtPos, ctrlZ.txtStatus, ctrlZ.txtTime, ctrlZ.btnHome, ctrlZ.btnMinus, ctrlZ.btnPlus, ctrlZ.btnGo, ctrlZ.btnStop);
 
-            if (_sequenceManager.IsMacroRunning && _sequenceManager.CurrentMacroIndex >= 0 && _sequenceManager.CurrentMacroIndex < _sequenceManager.MacroSequence.Count)
+            if (_isRecording)
+            {
+                // 기존 레코딩 로직 그대로 유지
+                DateTime now = DateTime.Now;
+                for (int i = 0; i < 3; i++)
+                {
+                    if (!_deviceController.IsConnected(i)) continue;
+                    double curPos = (double)_deviceController.GetPosition(i) * _unitMultiplier;
+
+                    if (_isDirectMoving[i] && !_deviceController.IsMoving(i))
+                    {
+                        double finalDist = _isInterrupted[i] ? (curPos - _lastRecordedPos[i]) : _plannedDist[i];
+                        lock (_recordLock)
+                        {
+                            _recordedPath.Add(new MacroCommand
+                            {
+                                Index = _recordedPath.Count + 1,
+                                AxisName = i == 0 ? "X" : (i == 1 ? "Y" : "Z"),
+                                AxisId = i,
+                                Mode = "Rel",
+                                Target = finalDist,
+                                Velocity = _plannedVel[i],
+                                IsSync = false
+                            });
+                        }
+                        _lastRecordedPos[i] = curPos; _lastRecordedTime[i] = now; _isDirectMoving[i] = false;
+                    }
+                    else if (!_isDirectMoving[i] && _deviceController.IsMoving(i))
+                    {
+                        double deltaPos = curPos - _lastRecordedPos[i];
+                        double dt = (now - _lastRecordedTime[i]).TotalSeconds;
+                        if (Math.Abs(deltaPos) > 0.0005 && dt > 0)
+                        {
+                            double v = Math.Min(Math.Abs(deltaPos) / dt, 2.0);
+                            lock (_recordLock)
+                            {
+                                _recordedPath.Add(new MacroCommand
+                                {
+                                    Index = _recordedPath.Count + 1,
+                                    AxisName = i == 0 ? "X" : (i == 1 ? "Y" : "Z"),
+                                    AxisId = i,
+                                    Mode = "Rel",
+                                    Target = deltaPos,
+                                    Velocity = Math.Round(v, 4),
+                                    IsSync = false
+                                });
+                            }
+                            _lastRecordedPos[i] = curPos; _lastRecordedTime[i] = now;
+                        }
+                    }
+                }
+            }
+
+            bool active = _sequenceManager.IsMacroRunning || _sequenceManager.IsArrayRunning || _isRecording ||
+                          (_deviceController.IsConnected(0) && _deviceController.IsMoving(0)) ||
+                          (_deviceController.IsConnected(1) && _deviceController.IsMoving(1)) ||
+                          (_deviceController.IsConnected(2) && _deviceController.IsMoving(2));
+            UpdatePollingMode(active);
+
+            if (_sequenceManager.IsMacroRunning &&
+                _sequenceManager.CurrentMacroIndex >= 0 &&
+                _sequenceManager.CurrentMacroIndex < _sequenceManager.MacroSequence.Count)
             {
                 var cmd = _sequenceManager.MacroSequence[_sequenceManager.CurrentMacroIndex];
-                if (cmd.AxisName != "WAIT") cmd.RemainingTime = _timeRemaining[cmd.AxisId];
+                if (cmd.AxisId < 3) _timeRemaining[cmd.AxisId] = cmd.RemainingTime;
             }
+
+            if (_sequenceManager.IsMacroRunning && int.TryParse(txtMacroLoops?.Text, out int totalLoops))
+            {
+                double remain = _sequenceManager.GetRemainingTotalSeconds(totalLoops);
+                if (txtTotalTime != null) txtTotalTime.Text = $"총 남은 시간: {TimeSpan.FromSeconds(remain):mm\\:ss}";
+            }
+        }
+
+        private void UpdatePollingMode(bool active)
+        {
+            if (_activePollingMode == active) return;
+            _activePollingMode = active;
+
+            _uiTimer.Interval = active ? TimeSpan.FromMilliseconds(200) : TimeSpan.FromMilliseconds(1000);
+            // 채널 폴링 주기 전환은 DeviceController 확장 메서드에서 일괄 처리 권장
         }
 
         private void UpdateAxisUI(int index, TextBlock txtPos, TextBlock txtStatus, TextBlock txtTime, Button btnHome, Button btnMinus, Button btnPlus, Button btnGo, Button btnStop)
@@ -399,15 +531,33 @@ namespace nanomaxtest
 
             if (_deviceController.IsMoving(index))
             {
+                _seenMovingAfterCommand[index] = true;
                 _moveCommanded[index] = false;
-                if (_targetVel[index] > 0) _timeRemaining[index] = Math.Abs(_targetPos[index] - displayPos) / _targetVel[index];
+
+                // [모듈: 타겟 기반 잔여 시간 선택적 차감] 
+                // 타겟 시간이 있는 구동일 때만 절대 시각 기반으로 차감하고, 조그 구동 시에는 시간 차감을 제외합니다.
+                if (_hasTargetTime[index])
+                {
+                    double remains = (_targetEndTime[index] - DateTime.Now).TotalSeconds;
+                    _timeRemaining[index] = remains > 0 ? remains : 0;
+                }
+                else
+                {
+                    _timeRemaining[index] = 0;
+                }
 
                 txtStatus.Text = "상태: 이동 중"; txtStatus.Foreground = Brushes.Blue;
                 btnHome.IsEnabled = false; btnMinus.IsEnabled = false; btnPlus.IsEnabled = false; btnGo.IsEnabled = false; btnStop.IsEnabled = true;
             }
             else
             {
-                if (!_moveCommanded[index]) _timeRemaining[index] = 0;
+                bool inGrace = (DateTime.Now - _targetIssuedAt[index]).TotalMilliseconds < 500;
+                if (!inGrace && (!_hasTargetTime[index] || _seenMovingAfterCommand[index]))
+                    _hasTargetTime[index] = false;
+
+
+                // 명령 직후 통신 지연(Dead time) 구간 보호를 위해, 출발 전 캡처된 잔여 시간이 남아있다면 강제 초기화를 보류합니다.
+                if (!_moveCommanded[index] && _timeRemaining[index] <= 0.25) _timeRemaining[index] = 0;
 
                 txtStatus.Text = "상태: 멈춤"; txtStatus.Foreground = Brushes.Red;
                 btnHome.IsEnabled = (!_sequenceManager.IsMacroRunning && !_sequenceManager.IsArrayRunning) && (chkAdminMode.IsChecked == true);
@@ -418,10 +568,11 @@ namespace nanomaxtest
             }
             txtTime.Text = $"남은 시간: {_timeRemaining[index]:F1}초";
         }
-
-        private async Task WaitUntilStopped(int index) => await _deviceController.WaitUntilStoppedAsync(index, () => !_sequenceManager.IsMacroRunning && !_sequenceManager.IsArrayRunning);
+        private async Task<bool> WaitUntilStopped(int index)
+    => await _deviceController.WaitUntilStoppedAsync(index, () => !_sequenceManager.IsMacroRunning && !_sequenceManager.IsArrayRunning);
 
         private async Task RunHomeAxis(int index)
+
         {
             LogAction($"UI CH {index + 1}", "Home 복귀 시도", "-", "-");
             try { await _deviceController.HomeAsync(index); }
@@ -431,7 +582,11 @@ namespace nanomaxtest
         private void StopAxis(int index)
         {
             _deviceController.StopProfiled(index);
-            _timeRemaining[index] = 0; _moveCommanded[index] = false;
+            _timeRemaining[index] = 0;
+            // [모듈: 중단 상태 기록 및 타이머 플래그 해제] 정지 시 잔여 시간 추적 플래그를 초기화하여 상태 정합성을 맞춥니다.
+            _hasTargetTime[index] = false;
+            if (_isRecording && _isDirectMoving[index]) _isInterrupted[index] = true;
+            _moveCommanded[index] = false; _isDirectMoving[index] = false;
             LogAction($"UI CH {index + 1}", "안전 정지", "-", "-");
         }
 
@@ -444,13 +599,28 @@ namespace nanomaxtest
         private async Task RunMoveAbsolute(int index, double pos, double vel, double acc, bool isMacro = false)
         {
             if (!_deviceController.IsConnected(index)) return;
+            // [모듈: 입력 파라미터 캡처] 레코딩 중일 때 사용자가 입력한 거리(변위)와 속도를 역산 없이 그대로 보관합니다.
+            if (_isRecording && !isMacro)
+            {
+                _plannedDist[index] = pos - ((double)_deviceController.GetPosition(index) * _unitMultiplier);
+                _plannedVel[index] = vel;
+                _isInterrupted[index] = false;
+                _isDirectMoving[index] = true;
+            }
             _targetPos[index] = pos; _targetVel[index] = vel; _moveCommanded[index] = true;
-            
-            if (vel > 0) _timeRemaining[index] = Math.Abs(pos - ((double)_deviceController.GetPosition(index) * _unitMultiplier)) / vel;
+
+            // [모듈: 도달 예정 시각 확정] 가감속에 의한 시간 늘어남 방지를 위해 시작 시점에 소요 시간을 딱 한 번만 계산하여 고정합니다.
+            double calcDuration = vel > 0 ? Math.Abs(pos - ((double)_deviceController.GetPosition(index) * _unitMultiplier)) / vel : 0;
+            _targetEndTime[index] = DateTime.Now.AddSeconds(calcDuration);
+            _timeRemaining[index] = calcDuration;
+            _hasTargetTime[index] = true;
+            _targetIssuedAt[index] = DateTime.Now;
+            _seenMovingAfterCommand[index] = false;
+
+
             LogAction($"UI CH {index + 1}", "이동 명령 하달", $"{pos}", $"{vel}");
 
-            try { await _deviceController.MoveAbsoluteAsync(index, (decimal)(pos / _unitMultiplier), (decimal)(vel / _unitMultiplier), (decimal)(acc / _unitMultiplier), isMacro); }
-            catch { _moveCommanded[index] = false; _timeRemaining[index] = 0; }
+            try { await _deviceController.MoveAbsoluteAsync(index, (decimal)(pos / _unitMultiplier), (decimal)(vel / _unitMultiplier), (decimal)(acc / _unitMultiplier), isMacro); } catch { _moveCommanded[index] = false; _timeRemaining[index] = 0; _hasTargetTime[index] = false; }
         }
 
         private void ExecuteMoveRelative(int axis, double dir, TextBox txtTarget, TextBox txtVel, TextBox txtAcc)
@@ -465,10 +635,20 @@ namespace nanomaxtest
                 _ = RunMoveAbsolute(axis, pos, vel, acc);
         }
 
-        private void HandleJog(int index, Slider slider) => _deviceController.StartJog(index, slider.Value);
+        private DateTime[] _lastJogTime = new DateTime[3];
+        private void HandleJog(int index, Slider slider)
+        {
+            // [모듈 수정: 시리얼 통신 마비 방지] 드래그 중 발생하는 수백 번의 연속 이벤트를 50ms 간격으로 스로틀링하여 Kinesis 드라이버 명령 버퍼의 오버플로우 차단
+            if ((DateTime.Now - _lastJogTime[index]).TotalMilliseconds < 50) return;
+            _lastJogTime[index] = DateTime.Now;
+            _hasTargetTime[index] = false;
+            _deviceController.StartJog(index, slider.Value);
+        }
+
         private void StopJog(int index, Slider slider)
         {
             slider.Value = 0;
+            _hasTargetTime[index] = false;
             _deviceController.StopProfiled(index);
             LogAction($"UI CH {index + 1}", "조그 이동 종료", "-", "-");
         }
@@ -544,7 +724,14 @@ namespace nanomaxtest
             _engine.CalculateMacroEstimatedTimes(_sequenceManager.MacroSequence, currentPos);
             dgMacro.Items.Refresh();
             if (btnMainStartMacro != null) btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
-        }   
+
+            // [모듈: 초기 총 소요 시간 표시]
+            double seqTotal = 0; foreach (var c in _sequenceManager.MacroSequence) seqTotal += c.BillingTime;
+            _sequenceManager.SetTotalEstimatedPerLoop(seqTotal);
+            int loops = int.TryParse(txtMacroLoops?.Text, out int l) ? l : 1;
+            if (txtTotalTime != null) txtTotalTime.Text = $"총 남은 시간: {TimeSpan.FromSeconds(seqTotal * loops):mm\\:ss}";
+
+        }
 
         private void dgMacro_CellEditEnding(object sender, DataGridCellEditEndingEventArgs e) => Dispatcher.BeginInvoke(new Action(() => CalculateMacroTimes()), DispatcherPriority.Background);
 
@@ -648,7 +835,8 @@ namespace nanomaxtest
             double currentVxy = 0;
             double.TryParse(inCircleVel.Text, out currentVxy);
             double totalVel = System.Math.Sqrt(currentVxy * currentVxy + vZ * vZ);
-            txtCircleTotalVel.Text = totalVel.ToString("0.0000");
+            // [모듈: 선속도 출력 정밀도 개선] 총 합성 선속도의 표시 자릿수를 소수점 아래 6자리로 확장합니다.
+            txtCircleTotalVel.Text = totalVel.ToString("0.000000");
         }
 
         private async void btnDrawCircle_Click(object sender, RoutedEventArgs e)
@@ -665,12 +853,12 @@ namespace nanomaxtest
             btnStartMacro.IsEnabled = false; btnDrawCircle.IsEnabled = false; btnStopMacro.IsEnabled = true;
             txtMacroStatus.Text = (zD != 0) ? "나선형 그리기 실행 중..." : "원형 그리기 실행 중..."; txtMacroStatus.Foreground = Brushes.Blue;
 
-            double sX = (double)_deviceController.GetPosition(0) * _unitMultiplier;
-            double sY = (double)_deviceController.GetPosition(1) * _unitMultiplier;
-            double sZ = zE ? (double)_deviceController.GetPosition(2) * _unitMultiplier : 0;
+            double sX = (double)_deviceController.GetPosition(0);
+            double sY = (double)_deviceController.GetPosition(1);
+            double sZ = zE ? (double)_deviceController.GetPosition(2) : 0;
 
             LogAction("XYZ", "원/나선 그리기 시작", $"직경:{d}, 루프:{loops}", $"XY속도:{vXY}");
-            await _sequenceManager.RunCirclePatternAsync(sX, sY, sZ, d, zD, vXY, vZ, steps, loops, zE);
+            await _sequenceManager.RunCirclePatternAsync(sX, sY, sZ, d / _unitMultiplier, zD / _unitMultiplier, vXY / _unitMultiplier, vZ / _unitMultiplier, steps, loops, zE);
 
             btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; btnDrawCircle.IsEnabled = true; btnStopMacro.IsEnabled = false;
             txtMacroStatus.Text = "대기 중"; txtMacroStatus.Foreground = Brushes.Black;
@@ -700,13 +888,18 @@ namespace nanomaxtest
 
         private async void btnStartMacro_Click(object sender, RoutedEventArgs e)
         {
-            if (_sequenceManager.MacroSequence.Count == 0) return;
-            if (!int.TryParse(txtMacroLoops.Text, out int totalLoops) || totalLoops < 1) { totalLoops = 1; txtMacroLoops.Text = "1"; }
+            try
+            {
+                dgMacro.CommitEdit(DataGridEditingUnit.Row, true);
+                if (_sequenceManager.MacroSequence.Count == 0) return;
 
-            CalculateMacroTimes();
-            btnStartMacro.IsEnabled = false; btnStopMacro.IsEnabled = true;
-            if (btnMainStartMacro != null) btnMainStartMacro.IsEnabled = false;
+                if (!int.TryParse(txtMacroLoops.Text, out int totalLoops) || totalLoops < 1) { totalLoops = 1; txtMacroLoops.Text = "1"; }
+
+            if (!_sequenceManager.IsMacroPaused) CalculateMacroTimes(); // 재개가 아닐 때만 타임라인 초기화
+            btnStartMacro.IsEnabled = false; btnStopMacro.IsEnabled = true; if (btnPauseMacro != null) btnPauseMacro.IsEnabled = true;
+            btnStartMacro.Content = "매크로 시작"; if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 실행"; btnMainStartMacro.IsEnabled = false; }
             if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = true;
+            if (btnMainPauseMacro != null) btnMainPauseMacro.IsEnabled = true;
 
             txtMacroStatus.Text = "매크로 실행 중..."; txtMacroStatus.Foreground = Brushes.Blue;
             LogAction("Macro", "매크로 시작", $"총 {_sequenceManager.MacroSequence.Count}단계", "-");
@@ -716,23 +909,51 @@ namespace nanomaxtest
             int slopeAxis = cmbArrayAxis != null ? cmbArrayAxis.SelectedIndex : 0;
             if (applySlope) LogAction("Macro", "기울기 보정 구동", $"축:{(slopeAxis == 0 ? "X" : "Y")}", $"m:{pureSlope:F6}");
 
-            await _sequenceManager.RunMacroSequenceAsync(totalLoops, chkNotifyEveryLoop.IsChecked == true, applySlope, pureSlope, slopeAxis);
+            try
+            {
+                // [모듈 수정: 앱 강제 종료 및 하드웨어 런어웨이 방지] async void 특성상 예외 발생 시 앱이 튕기며 장비가 무한 직진하는 것을 방지하기 위해 강제 예외 포착 및 장비 올스톱
+                await _sequenceManager.RunMacroSequenceAsync(totalLoops, chkNotifyEveryLoop.IsChecked == true, applySlope, pureSlope, slopeAxis);
+            }
+            catch (Exception ex)
+            {
+                _sequenceManager.StopAll();
+                MessageBox.Show($"매크로 실행 중 오류가 발생하여 긴급 정지했습니다.\n{ex.Message}", "비상 정지", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
 
             btnStartMacro.IsEnabled = true; btnStopMacro.IsEnabled = false;
             if (btnMainStartMacro != null) btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
             if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = false;
 
-            txtMacroStatus.Text = "매크로 완료 / 대기 중"; txtMacroStatus.Foreground = Brushes.Black;
-            dgMacro.Items.Refresh();
+                txtMacroStatus.Text = "매크로 완료 / 대기 중"; txtMacroStatus.Foreground = Brushes.Black;
+                dgMacro.Items.Refresh();
+            }
+            catch (Exception ex)
+            {
+                EnterFault(nameof(btnStartMacro_Click), ex);
+            }
         }
+
 
         private void btnStopMacro_Click(object sender, RoutedEventArgs e)
         {
             _sequenceManager.StopAll();
             txtMacroStatus.Text = "강제 정지됨"; txtMacroStatus.Foreground = Brushes.Red;
-            btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; btnStopMacro.IsEnabled = false; btnDrawCircle.IsEnabled = true;
-            if (btnMainStartMacro != null) btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
+            btnStartMacro.Content = "매크로 시작"; btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; btnStopMacro.IsEnabled = false; btnDrawCircle.IsEnabled = true;
+            if (btnPauseMacro != null) btnPauseMacro.IsEnabled = false;
+            if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 실행"; btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; }
             if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = false;
+            if (btnMainPauseMacro != null) btnMainPauseMacro.IsEnabled = false;
+        }
+
+        private void btnPauseMacro_Click(object sender, RoutedEventArgs e)
+        {
+            if (_sequenceManager.IsMacroRunning)
+            {
+                _sequenceManager.PauseMacro();
+                txtMacroStatus.Text = "일시중단됨"; txtMacroStatus.Foreground = Brushes.Orange;
+                btnStartMacro.Content = "매크로 재개"; btnStartMacro.IsEnabled = true;
+                if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 재개"; btnMainStartMacro.IsEnabled = true; }
+            }
         }
 
         private void LoadPresets() { cmbArrayPresets.Items.Clear(); foreach (var name in _presetManager.GetPresetNames()) cmbArrayPresets.Items.Add(name); }
@@ -825,7 +1046,16 @@ namespace nanomaxtest
             btnStartArray.IsEnabled = false; btnExportArray.IsEnabled = false; btnStopArray.IsEnabled = true;
             txtArrayStatus.Text = "어레이 프린팅 실행 중..."; txtArrayStatus.Foreground = Brushes.Blue;
 
-            await _sequenceManager.RunArrayPrintingAsync(p.Value.loops, p.Value.pDist, p.Value.pVel, p.Value.gDist, p.Value.gVel, p.Value.dVel, slopePerStep, cmbArrayAxis.SelectedIndex, gapDir, chkNotifyEveryLoop.IsChecked == true);
+            try
+            {
+                // [모듈 수정: 단위 역산 누락 해결 및 async void 예외 방지] 파라미터를 물리 단위로 변환 전달하고, 예외 발생 시 장비 비상 정지 연동
+                await _sequenceManager.RunArrayPrintingAsync(p.Value.loops, p.Value.pDist / _unitMultiplier, p.Value.pVel / _unitMultiplier, p.Value.gDist / _unitMultiplier, p.Value.gVel / _unitMultiplier, p.Value.dVel / _unitMultiplier, slopePerStep / _unitMultiplier, cmbArrayAxis.SelectedIndex, gapDir, chkNotifyEveryLoop.IsChecked == true);
+            }
+            catch (Exception ex)
+            {
+                btnStopArray_Click(null, null);
+                MessageBox.Show($"어레이 구동 중 오류가 발생했습니다.\n{ex.Message}", "비상 정지", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
 
             btnStartArray.IsEnabled = true; btnExportArray.IsEnabled = true; btnStopArray.IsEnabled = false;
             txtArrayStatus.Text = "완료 (또는 정지됨)"; txtArrayStatus.Foreground = Brushes.Black;
@@ -852,6 +1082,58 @@ namespace nanomaxtest
             try { _fileManager.SaveFeedback(_appDataPath, txtName.Text, txtFeedback.Text); txtFeedback.Clear(); txtName.Clear(); MessageBox.Show("저장 완료"); } catch { }
         }
 
+        // [모듈: 실시간 경로 레코딩 제어 및 매크로 CSV 추출]
+        private void btnToggleRecord_Click(object sender, RoutedEventArgs e)
+        {
+            _isRecording = !_isRecording;
+            if (_isRecording)
+            {
+                _recordedPath.Clear();
+                DateTime now = DateTime.Now;
+                // [모듈: 기준 위치 및 시간 초기화] 상대 변위(ds)와 시간(dt) 계산을 위해 시작 시점을 동기화합니다.
+                for (int i = 0; i < 3; i++)
+                {
+                    _lastRecordedPos[i] = _deviceController.IsConnected(i) ? (double)_deviceController.GetPosition(i) * _unitMultiplier : 0;
+                    _lastRecordedTime[i] = now;
+                }
+                btnToggleRecord.Content = "■ 경로 기록 중지";
+                btnToggleRecord.Background = new SolidColorBrush(Color.FromArgb(0xFF, 0xFF, 0xE0, 0xB2));
+                btnSaveRecordedPath.IsEnabled = false;
+            }
+
+            else
+            {
+                btnToggleRecord.Content = "● 경로 기록 시작";
+                // [모듈: 투명도 포함 색상 생성 오류 해결] 4개의 인자(A, R, G, B)를 지원하는 Color.FromArgb 메서드로 변경합니다.
+                btnToggleRecord.Background = new SolidColorBrush(Color.FromArgb(0xFF, 0xFF, 0xE0, 0xB2));
+                btnSaveRecordedPath.IsEnabled = _recordedPath.Count > 0;
+                MessageBox.Show($"경로 레코딩이 중지되었습니다. 총 {_recordedPath.Count}개의 포인트가 수집되었습니다.\n[기록 CSV 저장] 버튼을 눌러 매크로 파일로 추출하세요.", "레코딩 완료", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+
+        private void btnSaveRecordedPath_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                SaveFileDialog sfd = new SaveFileDialog { Filter = "CSV 파일 (*.csv)|*.csv", FileName = $"RecordedJogPath_{DateTime.Now:yyyyMMdd_HHmmss}.csv" };
+                if (sfd.ShowDialog() == true)
+                {
+                    List<MacroCommand> snapshot;
+                    lock (_recordLock) snapshot = new List<MacroCommand>(_recordedPath);
+
+                    StringBuilder sb = new StringBuilder();
+                    sb.AppendLine("순서,축(X/Y/Z/WAIT),모드(Abs/Rel),좌표/거리/시간,이동 속도,동시실행(O/X)");
+                    foreach (var cmd in snapshot)
+                    {
+
+                        sb.AppendLine($"{cmd.Index},{cmd.AxisName},{cmd.Mode},{cmd.Target:0.########},{cmd.Velocity:0.########},{(cmd.IsSync ? "O" : "X")}");
+                    }
+                    File.WriteAllText(sfd.FileName, sb.ToString(), Encoding.UTF8);
+                    MessageBox.Show("기록된 경로가 성공적으로 저장되었습니다.\n'매크로' 탭의 [CSV 불러오기]를 통해 그대로 구동시킬 수 있습니다.", "저장 완료", MessageBoxButton.OK, MessageBoxImage.Information);
+                }
+            }
+            catch (Exception ex) { MessageBox.Show($"저장 실패: {ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); }
+        }
         protected override void OnClosed(EventArgs e)
         {
             try

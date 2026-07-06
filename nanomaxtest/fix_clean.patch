@@ -1,0 +1,426 @@
+--- a/DeviceController.cs
++++ b/DeviceController.cs
+@@
+ using System;
+ using System.Collections.Generic;
++using System.Threading;
+ using System.Threading.Tasks;
+@@
+         private bool[] _simIsConnected = new bool[3];
+         private decimal[] _simPositions = new decimal[3];
+         private bool[] _simIsMoving = new bool[3];
++        private readonly object _simStateLock = new object();
++        private readonly CancellationTokenSource[] _simMoveCts = new CancellationTokenSource[3];
++        private readonly SemaphoreSlim[] _simMoveGate = new[]
++        {
++            new SemaphoreSlim(1, 1),
++            new SemaphoreSlim(1, 1),
++            new SemaphoreSlim(1, 1)
++        };
+@@
+         public void Disconnect()
+         {
+             if (IsSimulationMode)
+             {
+-                for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
++                for (int i = 0; i < 3; i++)
++                {
++                    _simIsConnected[i] = false;
++                    _simIsMoving[i] = false;
++                    lock (_simStateLock)
++                    {
++                        _simMoveCts[i]?.Cancel();
++                        _simMoveCts[i]?.Dispose();
++                        _simMoveCts[i] = null;
++                    }
++                }
+                 return;
+             }
+@@
+         public void StopProfiled(int index)
+         {
+             if (IsConnected(index))
+             {
+-                if (IsSimulationMode) _simIsMoving[index] = false;
++                if (IsSimulationMode)
++                {
++                    _simIsMoving[index] = false;
++                    lock (_simStateLock) _simMoveCts[index]?.Cancel();
++                }
+                 // [완벽 해결] SDK의 Action<ulong> 요구사항에 맞춰 빈 람다 함수 전달
+                 else _channels[index].Stop(t => { });
+             }
+         }
+@@
+         public async Task MoveAbsoluteAsync(int index, decimal targetPos, decimal targetVel, decimal targetAcc, bool ignoreIsMoving = false)
+         {
+             if (!IsConnected(index)) return;
+             if (!ignoreIsMoving && IsMoving(index)) return;
++            if (!TryApplySafetyGate(index, targetPos, targetVel, targetAcc, out var gatedPos, out var gatedVel, out var gatedAcc, out var reason))
++            {
++                SafetyLog?.Invoke($"[거부] {reason}");
++                throw new InvalidOperationException(reason);
++            }
++            if (!string.IsNullOrWhiteSpace(reason)) SafetyLog?.Invoke($"[보정] 축{index} {reason}");
+
+             if (IsSimulationMode)
+             {
+-                _simIsMoving[index] = true;
+-                decimal startPos = _simPositions[index];
+-                decimal dist = Math.Abs(targetPos - startPos);
+-                int delayMs = targetVel > 0 ? (int)((dist / targetVel) * 1000) : 0;
+-
+-                _ = Task.Run(async () =>
+-                {
+-                    int steps = delayMs / 50;
+-                    if (steps > 0)
+-                    {
+-                        for (int i = 1; i <= steps; i++)
+-                        {
+-                            if (!_simIsMoving[index]) break;
+-                            await Task.Delay(50);
+-                            _simPositions[index] = startPos + (targetPos - startPos) * ((decimal)i / steps);
+-                        }
+-                    }
+-                    if (_simIsMoving[index]) _simPositions[index] = targetPos;
+-                    _simIsMoving[index] = false;
+-                });
++                CancellationTokenSource localCts;
++                lock (_simStateLock)
++                {
++                    _simMoveCts[index]?.Cancel();
++                    _simMoveCts[index]?.Dispose();
++                    localCts = new CancellationTokenSource();
++                    _simMoveCts[index] = localCts;
++                }
++
++                await _simMoveGate[index].WaitAsync().ConfigureAwait(false);
++                try
++                {
++                    bool superseded;
++                    lock (_simStateLock) superseded = !ReferenceEquals(_simMoveCts[index], localCts);
++                    if (superseded) return;
++
++                    _simIsMoving[index] = true;
++                    decimal startPos = _simPositions[index];
++                    decimal dist = Math.Abs(gatedPos - startPos);
++                    int delayMs = gatedVel > 0 ? (int)((dist / gatedVel) * 1000m) : 0;
++                    if (delayMs <= 0)
++                    {
++                        _simPositions[index] = gatedPos;
++                        return;
++                    }
++
++                    int steps = Math.Max(1, (int)Math.Ceiling(delayMs / 50.0));
++                    int stepDelay = Math.Max(1, delayMs / steps);
++                    for (int i = 1; i <= steps; i++)
++                    {
++                        bool keepRunning;
++                        lock (_simStateLock) keepRunning = ReferenceEquals(_simMoveCts[index], localCts);
++                        if (!keepRunning || !_simIsMoving[index]) break;
++
++                        await Task.Delay(stepDelay, localCts.Token).ConfigureAwait(false);
++                        _simPositions[index] = startPos + (gatedPos - startPos) * ((decimal)i / steps);
++                    }
++
++                    bool completeNormally;
++                    lock (_simStateLock) completeNormally = ReferenceEquals(_simMoveCts[index], localCts);
++                    if (completeNormally && _simIsMoving[index]) _simPositions[index] = gatedPos;
++                }
++                catch (OperationCanceledException) { }
++                finally
++                {
++                    lock (_simStateLock)
++                    {
++                        if (ReferenceEquals(_simMoveCts[index], localCts))
++                        {
++                            _simIsMoving[index] = false;
++                            _simMoveCts[index]?.Dispose();
++                            _simMoveCts[index] = null;
++                        }
++                    }
++                    _simMoveGate[index].Release();
++                }
+                 return;
+             }
+-
+-            if (!TryApplySafetyGate(index, targetPos, targetVel, targetAcc, out var gatedPos, out var gatedVel, out var gatedAcc, out var reason))
+-            {
+-                SafetyLog?.Invoke($"[거부] {reason}");
+-                throw new InvalidOperationException(reason);
+-            }
+-            if (!string.IsNullOrWhiteSpace(reason)) SafetyLog?.Invoke($"[보정] 축{index} {reason}");
+
+             await Task.Run(() =>
+             {
+--- a/TaskSequenceManager.cs
++++ b/TaskSequenceManager.cs
+@@
+-        public volatile bool IsMacroPaused = false; // [모듈: 일시중단 상태 추가]
+         public int CurrentMacroIndex { get; set; } = -1; // 누락된 인덱스 추적 속성 추가
+         public int CurrentLoopIndex { get; set; } = 1;
+@@
+                 await Task.WhenAll(
+                     _deviceCtrl.MoveAbsoluteAsync(0, decimal.Round((decimal)(centerX + r), 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true),
+                     _deviceCtrl.MoveAbsoluteAsync(1, decimal.Round((decimal)centerY, 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true)
+                 );
++                bool enteredX = await _deviceCtrl.WaitUntilStoppedAsync(0, () => !IsMacroRunning);
++                bool enteredY = await _deviceCtrl.WaitUntilStoppedAsync(1, () => !IsMacroRunning);
++                if (!enteredX || !enteredY)
++                {
++                    completedNormally = false;
++                    return;
++                }
+@@
+                 foreach (var pt in trajectory)
+                 {
+-                    if (!IsMacroRunning) break;
++                    if (!IsMacroRunning)
++                    {
++                        completedNormally = false;
++                        break;
++                    }
+@@
+                     await Task.WhenAll(taskX, taskY, taskZ);
++                    bool stepX = await _deviceCtrl.WaitUntilStoppedAsync(0, () => !IsMacroRunning);
++                    bool stepY = await _deviceCtrl.WaitUntilStoppedAsync(1, () => !IsMacroRunning);
++                    bool stepZ = !zEnabled || zDistPerTurn == 0 || await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsMacroRunning);
++                    if (!stepX || !stepY || !stepZ)
++                    {
++                        completedNormally = false;
++                        break;
++                    }
+                     currentStep++;
+                 }
+@@
+                 if (zEnabled && zDistPerTurn != 0)
+                 {
+-                    await _deviceCtrl.WaitUntilStoppedAsync(2);
++                    bool finalZ = await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsMacroRunning);
++                    if (!finalZ) completedNormally = false;
+                 }
+@@
+         public void StopAll()
+         {
+-            IsMacroRunning = false; IsArrayRunning = false; IsMacroPaused = false;
++            IsMacroRunning = false; IsArrayRunning = false;
+             CurrentMacroIndex = -1; CurrentLoopIndex = 1;
+             foreach (var cmd in MacroSequence) cmd.HasRuntimeTarget = false; // 캐시 초기화
+@@
+-        public void PauseMacro()
+-        {
+-            IsMacroRunning = false; IsMacroPaused = true;
+-            for (int i = 0; i < 3; i++) _deviceCtrl.StopProfiled(i); // 감속 정지
+-        }
+-
+         // [모듈: 실시간 기판 기울기가 반영된 매크로 시퀀스 실행 루프]
+         public async Task RunMacroSequenceAsync(int totalLoops, bool notifyEveryLoop, bool applySlope = false, double slopeM = 0, int slopeAxis = 0)
+         {
+             IsMacroRunning = true;
+             bool completedNormally = true;
+             CompletedTimeInCurrentLoop = 0;
+             _macroSw.Restart();
++            foreach (var cmd in MacroSequence) cmd.HasRuntimeTarget = false;
+@@
+-            int startLoop = IsMacroPaused ? CurrentLoopIndex : 1;
+-            int startIdx = IsMacroPaused ? Math.Max(0, CurrentMacroIndex) : 0;
+-            IsMacroPaused = false; // 재개 후 플래그 해제
+-
+-            for (int loopIndex = startLoop; loopIndex <= totalLoops; loopIndex++)
++            for (int loopIndex = 1; loopIndex <= totalLoops; loopIndex++)
+             {
+                 CurrentLoopIndex = loopIndex;
+                 CompletedTimeInCurrentLoop = 0;
+-                if (!IsMacroRunning) { IsMacroPaused = true; completedNormally = false; break; }
++                if (!IsMacroRunning) { completedNormally = false; break; }
+@@
+-                for (int i = startIdx; i < MacroSequence.Count; i++)
++                for (int i = 0; i < MacroSequence.Count; i++)
+                 {
+-                    if (!IsMacroRunning) { IsMacroPaused = true; completedNormally = false; break; }
++                    if (!IsMacroRunning) { completedNormally = false; break; }
+@@
+-                        if (!allStopped) { completedNormally = false; IsMacroPaused = true; break; }
++                        if (!allStopped) { completedNormally = false; break; }
+@@
+-                startIdx = 0; // 다음 반복 루프는 처음(0)부터 시작
+-
+                 if (completedNormally && notifyEveryLoop && totalLoops > 1 && loopIndex < totalLoops)
+                     NotificationRequested?.Invoke($"매크로 {loopIndex}/{totalLoops}회 반복 완료");
+             }
+@@
+             _macroSw.Stop();
+             IsMacroRunning = false;
++            CurrentMacroIndex = -1;
++            CurrentLoopIndex = 1;
+             if (completedNormally) NotificationRequested?.Invoke($"매크로 실행이 완료되었습니다. (총 {totalLoops}회)");
+         }
+--- a/MainWindow.xaml.cs
++++ b/MainWindow.xaml.cs
+@@
+-            if (_deviceController.IsMoving(index))
++            bool axisMoving = _deviceController.IsMoving(index);
++            if (axisMoving)
+             {
+                 _seenMovingAfterCommand[index] = true;
+                 _moveCommanded[index] = false;
++                bool isSettling = false;
+@@
+                 if (_hasTargetTime[index])
+                 {
+                     double remains = (_targetEndTime[index] - DateTime.Now).TotalSeconds;
+                     _timeRemaining[index] = remains > 0 ? remains : 0;
++                    isSettling = _timeRemaining[index] <= 0;
+                 }
+                 else
+                 {
+                     _timeRemaining[index] = 0;
++                    isSettling = true;
+                 }
+
+-                txtStatus.Text = "상태: 이동 중"; txtStatus.Foreground = Brushes.Blue;
++                txtStatus.Text = isSettling ? "상태: 정착 대기" : "상태: 이동 중";
++                txtStatus.Foreground = isSettling ? Brushes.Orange : Brushes.Blue;
+                 btnHome.IsEnabled = false; btnMinus.IsEnabled = false; btnPlus.IsEnabled = false; btnGo.IsEnabled = false; btnStop.IsEnabled = true;
+             }
+             else
+@@
+-            txtTime.Text = $"남은 시간: {_timeRemaining[index]:F1}초";
++            txtTime.Text = axisMoving && (_timeRemaining[index] <= 0 || !_hasTargetTime[index])
++                ? "남은 시간: 정착 대기"
++                : $"남은 시간: {_timeRemaining[index]:F1}초";
+         }
+@@
+-            try { await _deviceController.MoveAbsoluteAsync(index, (decimal)(pos / _unitMultiplier), (decimal)(vel / _unitMultiplier), (decimal)(acc / _unitMultiplier), isMacro); } catch { _moveCommanded[index] = false; _timeRemaining[index] = 0; _hasTargetTime[index] = false; }
++            try
++            {
++                await _deviceController.MoveAbsoluteAsync(index, (decimal)(pos / _unitMultiplier), (decimal)(vel / _unitMultiplier), (decimal)(acc / _unitMultiplier), isMacro);
++            }
++            catch (InvalidOperationException ex)
++            {
++                _moveCommanded[index] = false;
++                _timeRemaining[index] = 0;
++                _hasTargetTime[index] = false;
++                _isDirectMoving[index] = false;
++                LogAction($"UI CH {index + 1}", "이동 거부", $"{pos}", $"{vel}");
++                txtGlobalStatus.Text = $"축 {index + 1} 이동 거부: {ex.Message}";
++                txtGlobalStatus.Foreground = Brushes.OrangeRed;
++                MessageBox.Show($"축 {index + 1} 이동이 Safety Gate에서 거부되었습니다.\n{ex.Message}", "이동 거부", MessageBoxButton.OK, MessageBoxImage.Warning);
++            }
++            catch (Exception ex)
++            {
++                _moveCommanded[index] = false;
++                _timeRemaining[index] = 0;
++                _hasTargetTime[index] = false;
++                _isDirectMoving[index] = false;
++                txtGlobalStatus.Text = $"축 {index + 1} 이동 오류";
++                txtGlobalStatus.Foreground = Brushes.Red;
++                MessageBox.Show($"축 {index + 1} 이동 중 오류 발생:\n{ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error);
++            }
+@@
+         private void UiTimer_Tick(object sender, EventArgs e)
+@@
+             if (_sequenceManager.IsMacroRunning && int.TryParse(txtMacroLoops?.Text, out int totalLoops))
+             {
+                 double remain = _sequenceManager.GetRemainingTotalSeconds(totalLoops);
+-                if (txtTotalTime != null) txtTotalTime.Text = $"총 남은 시간: {TimeSpan.FromSeconds(remain):mm\\:ss}";
++                UpdateTotalRemainingTime(remain);
+             }
+         }
++
++        private void SetTotalRemainingTimeText(string text)
++        {
++            if (txtTotalTime != null) txtTotalTime.Text = text;
++            if (FindName("txtMainTotalTime") is TextBlock tbMain) tbMain.Text = text;
++        }
++
++        private void UpdateTotalRemainingTime(double remainSeconds)
++        {
++            TimeSpan ts = TimeSpan.FromSeconds(Math.Max(0, remainSeconds));
++            SetTotalRemainingTimeText($"총 남은 시간: {ts:mm\\:ss}");
++        }
+@@
+             double seqTotal = 0; foreach (var c in _sequenceManager.MacroSequence) seqTotal += c.BillingTime;
+             _sequenceManager.SetTotalEstimatedPerLoop(seqTotal);
+             int loops = int.TryParse(txtMacroLoops?.Text, out int l) ? l : 1;
+-            if (txtTotalTime != null) txtTotalTime.Text = $"총 남은 시간: {TimeSpan.FromSeconds(seqTotal * loops):mm\\:ss}";
++            UpdateTotalRemainingTime(seqTotal * loops);
+@@
+-        private void btnClearMacro_Click(object sender, RoutedEventArgs e) { _sequenceManager.MacroSequence.Clear(); btnStartMacro.IsEnabled = false; }
++        private void btnClearMacro_Click(object sender, RoutedEventArgs e) { _sequenceManager.MacroSequence.Clear(); btnStartMacro.IsEnabled = false; SetTotalRemainingTimeText("총 남은 시간: --"); }
+@@
+-            if (!_sequenceManager.IsMacroPaused) CalculateMacroTimes(); // 재개가 아닐 때만 타임라인 초기화
+-            btnStartMacro.IsEnabled = false; btnStopMacro.IsEnabled = true; if (btnPauseMacro != null) btnPauseMacro.IsEnabled = true;
++            CalculateMacroTimes();
++            btnStartMacro.IsEnabled = false; btnStopMacro.IsEnabled = true;
+             btnStartMacro.Content = "매크로 시작"; if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 실행"; btnMainStartMacro.IsEnabled = false; }
+             if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = true;
+-            if (btnMainPauseMacro != null) btnMainPauseMacro.IsEnabled = true;
+@@
+-                txtMacroStatus.Text = "매크로 완료 / 대기 중"; txtMacroStatus.Foreground = Brushes.Black;
++                txtMacroStatus.Text = "매크로 완료 / 대기 중"; txtMacroStatus.Foreground = Brushes.Black;
++                UpdateTotalRemainingTime(0);
+                 dgMacro.Items.Refresh();
+@@
+         private void btnStopMacro_Click(object sender, RoutedEventArgs e)
+         {
+             _sequenceManager.StopAll();
+             txtMacroStatus.Text = "강제 정지됨"; txtMacroStatus.Foreground = Brushes.Red;
+             btnStartMacro.Content = "매크로 시작"; btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; btnStopMacro.IsEnabled = false; btnDrawCircle.IsEnabled = true;
+-            if (btnPauseMacro != null) btnPauseMacro.IsEnabled = false;
+             if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 실행"; btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; }
+             if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = false;
+-            if (btnMainPauseMacro != null) btnMainPauseMacro.IsEnabled = false;
++            UpdateTotalRemainingTime(0);
+         }
+@@
+         private void btnPauseMacro_Click(object sender, RoutedEventArgs e)
+         {
+-            if (_sequenceManager.IsMacroRunning)
+-            {
+-                _sequenceManager.PauseMacro();
+-                txtMacroStatus.Text = "일시중단됨"; txtMacroStatus.Foreground = Brushes.Orange;
+-                btnStartMacro.Content = "매크로 재개"; btnStartMacro.IsEnabled = true;
+-                if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 재개"; btnMainStartMacro.IsEnabled = true; }
+-            }
++            btnStopMacro_Click(sender, e);
+         }
+@@
+         private async void btnDrawCircle_Click(object sender, RoutedEventArgs e)
+@@
+             btnStartMacro.IsEnabled = false; btnDrawCircle.IsEnabled = false; btnStopMacro.IsEnabled = true;
+             txtMacroStatus.Text = (zD != 0) ? "나선형 그리기 실행 중..." : "원형 그리기 실행 중..."; txtMacroStatus.Foreground = Brushes.Blue;
+-
+-            double sX = (double)_deviceController.GetPosition(0);
+-            double sY = (double)_deviceController.GetPosition(1);
+-            double sZ = zE ? (double)_deviceController.GetPosition(2) : 0;
+-
+-            LogAction("XYZ", "원/나선 그리기 시작", $"직경:{d}, 루프:{loops}", $"XY속도:{vXY}");
+-            await _sequenceManager.RunCirclePatternAsync(sX, sY, sZ, d / _unitMultiplier, zD / _unitMultiplier, vXY / _unitMultiplier, vZ / _unitMultiplier, steps, loops, zE);
+-
+-            btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; btnDrawCircle.IsEnabled = true; btnStopMacro.IsEnabled = false;
+-            txtMacroStatus.Text = "대기 중"; txtMacroStatus.Foreground = Brushes.Black;
++            try
++            {
++                double sX = (double)_deviceController.GetPosition(0);
++                double sY = (double)_deviceController.GetPosition(1);
++                double sZ = zE ? (double)_deviceController.GetPosition(2) : 0;
++
++                LogAction("XYZ", "원/나선 그리기 시작", $"직경:{d}, 루프:{loops}", $"XY속도:{vXY}");
++                await _sequenceManager.RunCirclePatternAsync(sX, sY, sZ, d / _unitMultiplier, zD / _unitMultiplier, vXY / _unitMultiplier, vZ / _unitMultiplier, steps, loops, zE);
++                txtMacroStatus.Text = "대기 중"; txtMacroStatus.Foreground = Brushes.Black;
++            }
++            catch (Exception ex)
++            {
++                _sequenceManager.StopAll();
++                txtMacroStatus.Text = "원/나선 실행 중 오류로 정지됨";
++                txtMacroStatus.Foreground = Brushes.Red;
++                MessageBox.Show($"원/나선 실행 중 오류가 발생하여 긴급 정지했습니다.\n{ex.Message}", "비상 정지", MessageBoxButton.OK, MessageBoxImage.Error);
++            }
++            finally
++            {
++                btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
++                btnDrawCircle.IsEnabled = true;
++                btnStopMacro.IsEnabled = false;
++            }
+         }

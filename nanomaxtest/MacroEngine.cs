@@ -23,23 +23,33 @@ namespace nanomaxtest.Engines
             return totalPathXY / xyTime;
         }
 
-        // [모듈: Catmull-Rom Spline 기반 등속(Constant Velocity) 연속 궤적 생성기]
-        // 속도 벡터의 크기(|v|)를 상수로 유지하기 위해 미소 길이(ds) 단위로 곡선을 보간합니다.
-        public List<TrajectoryPoint> GenerateSimpleTrajectory(double startX, double startY, double diameter, int steps, int loops)
+        // 원 중심을 명시적으로 정의하고 루프 단위로 닫힌 궤적을 생성
+        public List<TrajectoryPoint> GenerateSimpleTrajectory(double approachX, double approachY, double diameter, int steps, int loops)
         {
             var trajectory = new List<TrajectoryPoint>();
+            if (steps < 4 || loops < 1 || diameter <= 0) return trajectory;
+
             double r = diameter / 2.0;
-            for (int i = 1; i <= (steps * loops); i++)
+            double centerX = approachX - r;
+            double centerY = approachY;
+
+            for (int lp = 0; lp < loops; lp++)
             {
-                double angle = 2 * Math.PI * i / steps;
-                trajectory.Add(new TrajectoryPoint
+                for (int s = 1; s <= steps; s++)
                 {
-                    TargetX = startX + r * Math.Cos(angle) - r,
-                    TargetY = startY + r * Math.Sin(angle)
-                });
+                    double theta = (2.0 * Math.PI * s / steps) + (2.0 * Math.PI * lp);
+                    trajectory.Add(new TrajectoryPoint
+                    {
+                        TargetX = centerX + r * Math.Cos(theta),
+                        TargetY = centerY + r * Math.Sin(theta)
+                    });
+                }
             }
             return trajectory;
         }
+
+        // [모듈: 어레이 프린팅 기울기 도출 (최소제곱법)]
+
 
         // [모듈: 어레이 프린팅 기울기 도출 (최소제곱법)]
         public double CalculateArraySlope(IEnumerable<ArrayPoint> points, double gapDist, int gapDirIndex)
@@ -143,10 +153,34 @@ namespace nanomaxtest.Engines
 
                     double t = v > 0 ? System.Math.Abs(dist) / v : 0;
                     cmd.EstimatedTime = t;
+                    cmd.RemainingTime = t; // [모듈: 버그 수정] 시작 전 모든 명령의 초기 남은 시간 세팅
                     maxTime = System.Math.Max(maxTime, t);
                 }
 
+                // [모듈 수정: 다축 동기화(Interpolation) 궤적 붕괴 해결] 동기화 그룹 내의 모든 축이 가장 오래 걸리는 시간(maxTime)에 맞춰 도착하도록 목표 시간을 통일하여 완전한 직선 궤적 보장
+                if (batch.Count > 1)
+                {
+                    bool billed = false;
+                    foreach (var cmd in batch)
+                    {
+                        if (cmd.AxisName == "WAIT")
+                        {
+                            cmd.BillingTime = cmd.Target;
+                            continue;
+                        }
+                        cmd.EstimatedTime = cmd.RemainingTime = maxTime;
+                        cmd.BillingTime = billed ? 0 : maxTime;
+                        billed = true;
+                    }
+                }
+                else
+                {
+                    var only = batch[0];
+                    only.BillingTime = only.EstimatedTime;
+                }
+
                 // 2차 합성 속도 V = sqrt(vx^2 + vy^2 + vz^2) 및 실제 구동 각도 도출
+
                 double resultantVel = System.Math.Sqrt(sumVelSq);
                 string angleStr = "0.0°";
                 int movingAxesCount = 0;
@@ -215,7 +249,8 @@ namespace nanomaxtest.Engines
                     else if (cmd.AxisName == "WAIT" || cmd.AxisName == "W") cmd.AxisId = 3;
                     else continue;
 
-                    cmd.Mode = cols[2].Trim() == "Abs" ? "Abs" : "Rel";
+                    // [모듈 수정: 하드웨어 충돌 방지] 대소문자("ABS", "abs") 구분 오작동으로 인해 절대 좌표 이동이 상대 좌표(Rel)로 변환되어 장비 리미트 충돌이 발생하는 현상 원천 차단
+                    cmd.Mode = cols[2].Trim().Equals("Abs", StringComparison.OrdinalIgnoreCase) ? "Abs" : "Rel";
 
                     if (double.TryParse(cols[3], out double target) && double.TryParse(cols[4], out double vel))
                     {

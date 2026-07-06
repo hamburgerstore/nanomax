@@ -22,7 +22,12 @@ namespace nanomaxtest.Managers
             }
         }
 
-        private void SaveCache() => File.WriteAllLines(_presetFilePath, _cache.Values, Encoding.UTF8);
+        // [모듈 수정: 파일 시스템 페일세이프] AppData 폴더 내 대상 디렉토리가 존재하지 않을 경우 발생하는 DirectoryNotFoundException(앱 크래시) 방지
+        private void SaveCache()
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_presetFilePath));
+            File.WriteAllLines(_presetFilePath, _cache.Values, Encoding.UTF8);
+        }
 
         public List<string> GetPresetNames() => new List<string>(_cache.Keys);
 

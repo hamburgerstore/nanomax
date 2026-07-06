@@ -19,8 +19,70 @@ namespace nanomaxtest.Controllers
         private BenchtopStepperMotor _device;
         private StepperMotorChannel[] _channels = new StepperMotorChannel[3];
 
+        private readonly object _safetyLock = new object();
+        private readonly decimal[] _lastAcc = new decimal[3];
+        private readonly DateTime[] _lastCmdAt = new DateTime[3];
+        private readonly decimal[] _axisMaxVel = new decimal[] { 2.0m, 2.0m, 1.5m };
+        private readonly decimal[] _axisMaxAcc = new decimal[] { 5.0m, 5.0m, 2.5m };
+        public Action<string> SafetyLog;
+
+        private static decimal Quantize(decimal v, decimal res = 0.00001m)
+            => res <= 0 ? v : decimal.Round(v / res, 0, MidpointRounding.AwayFromZero) * res;
+
+        private bool TryApplySafetyGate(int axis, decimal targetPos, decimal targetVel, decimal targetAcc,
+            out decimal gatedPos, out decimal gatedVel, out decimal gatedAcc, out string reason)
+        {
+            gatedPos = Quantize(targetPos);
+            gatedVel = Quantize(targetVel);
+            gatedAcc = Quantize(targetAcc);
+            reason = "";
+
+            if (gatedPos < 0m || gatedPos > 4.0m)
+            {
+                reason = $"축 {axis} 목표좌표 {gatedPos:F5}mm가 리밋(0~4mm)을 벗어남";
+                return false;
+            }
+
+            if (gatedVel <= 0m || gatedAcc <= 0m)
+            {
+                reason = $"축 {axis} 속도/가속도는 양수여야 함 (v={gatedVel:F5}, a={gatedAcc:F5})";
+                return false;
+            }
+
+            if (gatedVel > _axisMaxVel[axis])
+            {
+                reason += $" v:{gatedVel:F5}->{_axisMaxVel[axis]:F5} 클램프;";
+                gatedVel = _axisMaxVel[axis];
+            }
+            if (gatedAcc > _axisMaxAcc[axis])
+            {
+                reason += $" a:{gatedAcc:F5}->{_axisMaxAcc[axis]:F5} 클램프;";
+                gatedAcc = _axisMaxAcc[axis];
+            }
+
+            lock (_safetyLock)
+            {
+                if (_lastCmdAt[axis] != default)
+                {
+                    decimal dt = (decimal)Math.Max((DateTime.UtcNow - _lastCmdAt[axis]).TotalSeconds, 0.01);
+                    decimal jerk = Math.Abs(gatedAcc - _lastAcc[axis]) / dt;
+                    if (jerk > 50m)
+                    {
+                        decimal limitedAcc = _lastAcc[axis] + Math.Sign(gatedAcc - _lastAcc[axis]) * 50m * dt;
+                        reason += $" jerk 제한으로 a:{gatedAcc:F5}->{limitedAcc:F5};";
+                        gatedAcc = Quantize(Math.Max(0.01m, limitedAcc));
+                    }
+                }
+                _lastAcc[axis] = gatedAcc;
+                _lastCmdAt[axis] = DateTime.UtcNow;
+            }
+
+            return true;
+        }
+
         public IList<string> GetDeviceList()
         {
+
             if (IsSimulationMode) return new List<string> { "99999999 (가상 장비 시뮬레이터)" };
             DeviceManagerCLI.BuildDeviceList();
             return DeviceManagerCLI.GetDeviceList();
@@ -46,6 +108,8 @@ namespace nanomaxtest.Controllers
             await Task.Delay(500); // 비동기 초기화 타이밍 병목 해결을 위한 필수 지연
 
             await Task.Run(() =>
+            {
+            try
             {
                 Disconnect();
                 System.Threading.Thread.Sleep(200); // 포트 반환 안정화 딜레이
@@ -76,10 +140,12 @@ namespace nanomaxtest.Controllers
                 _device.Connect(cleanSerial);
                 System.Threading.Thread.Sleep(500);
 
+                short[] targetChs = { 3, 2, 1 }; // 논리 인덱스 0(X)->CH3, 1(Y)->CH2, 2(Z)->CH1
                 for (int i = 0; i < 3; i++)
                 {
                     StepperMotorChannel channel = null;
-                    short[] candidateIds = { (short)(i + 1), (short)i };
+                    // [모듈: 하드웨어 채널 매핑 보정] 물리 하드웨어 채널 순서를 소프트웨어의 직교 좌표계 인덱스에 강제 동기화합니다.
+                    short[] candidateIds = { targetChs[i], (short)(targetChs[i] - 1) };
 
                     foreach (short id in candidateIds)
                     {
@@ -120,45 +186,56 @@ namespace nanomaxtest.Controllers
 
                     System.Threading.Thread.Sleep(100);
 
-                    var deviceSettings = _channels[i].MotorDeviceSettings;
-                    if (deviceSettings == null)
-                    {
-                        throw new Exception($"모터 채널(축 {i + 1})의 세부 설정(DeviceSettings) 인스턴스를 확보하지 못했습니다.");
+                        var deviceSettings = _channels[i].MotorDeviceSettings;
+                        if (deviceSettings == null)
+                        {
+                            throw new Exception($"모터 채널(축 {i + 1})의 세부 설정(DeviceSettings) 인스턴스를 확보하지 못했습니다.");
+                        }
+
+                        _channels[i].SetSettings(deviceSettings, true, true);
+
+                        // [모듈 수정: 메니스커스 파괴 및 충돌 방지] Thorlabs 컨트롤러의 기본 기능인 '백래쉬 보정(Backlash Compensation)' 비활성화. Z축 하강 시 의도적인 오버슛(Overshoot)으로 인해 기판에 충돌하는 현상을 원천 차단.
+                        _channels[i].SetBacklash(0m);
+
+                        _channels[i].StartPolling(250);
+                        _channels[i].EnableDevice();
                     }
-
-                    _channels[i].SetSettings(deviceSettings, true, true);
-
-                    _channels[i].StartPolling(250);
-                    _channels[i].EnableDevice();
+                }
+                catch
+                {
+                    // [모듈 수정: 예외 시 핸들 해제] 초기화 실패 시 기존에 연결된 모터 핸들과 폴링 스레드를 강제 정리하여 교착 상태(Deadlock) 차단
+                    Disconnect();
+                    throw;
                 }
             });
         }
 
         public void Disconnect()
         {
+            if (IsSimulationMode)
             {
-                if (IsSimulationMode)
-                {
-                    for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
-                    return;
-                }
+                for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
+                return;
+            }
 
-                for (int i = 0; i < 3; i++)
+            for (int i = 0; i < 3; i++)
+            {
+                if (_channels[i] != null && _channels[i].IsConnected)
                 {
-                    if (_channels[i] != null && _channels[i].IsConnected)
-                    {
-                        _channels[i].StopPolling();
-                        _channels[i] = null;
-                    }
-                }
-
-                if (_device != null)
-                {
-                    _device.Disconnect(true);
-                    _device = null;
+                    try { _channels[i].DisableDevice(); } catch { }
+                    try { _channels[i].StopPolling(); } catch { }
+                    _channels[i] = null;
                 }
             }
+
+            if (_device != null)
+
+            {
+            _device.Disconnect(true);
+            _device = null;
+            }
         }
+        
 
         public bool IsConnected(int index) => IsSimulationMode ? _simIsConnected[index] : (_channels[index] != null && _channels[index].IsConnected);
         public bool IsMoving(int index) => IsSimulationMode ? _simIsMoving[index] : (IsConnected(index) && _channels[index].Status.IsMoving);
@@ -182,24 +259,25 @@ namespace nanomaxtest.Controllers
             }
         }
 
-        public async Task WaitUntilStoppedAsync(int index, Func<bool> checkCancel = null)
+        public async Task<bool> WaitUntilStoppedAsync(int index, Func<bool> checkCancel = null)
         {
-            if (!IsConnected(index)) return;
+            if (!IsConnected(index)) return true;
 
             if (IsSimulationMode)
             {
                 while (_simIsMoving[index])
                 {
-                    if (checkCancel != null && checkCancel()) break;
+                    if (checkCancel != null && checkCancel()) return false;
                     await Task.Delay(50);
                 }
-                return;
+                return true;
             }
+
 
             int stopConfirmCount = 0;
             while (true)
             {
-                if (checkCancel != null && checkCancel()) break;
+                if (checkCancel != null && checkCancel()) return false;
 
                 if (!_channels[index].Status.IsMoving)
                 {
@@ -210,6 +288,7 @@ namespace nanomaxtest.Controllers
 
                 await Task.Delay(50);
             }
+            return true;
         }
 
         public async Task HomeAsync(int index)
@@ -277,23 +356,21 @@ namespace nanomaxtest.Controllers
                 return;
             }
 
-            decimal safeAcc = Math.Min(targetAcc, 2.0m);
-            decimal safeVel = Math.Min(targetVel, 1.5m);
+            if (!TryApplySafetyGate(index, targetPos, targetVel, targetAcc, out var gatedPos, out var gatedVel, out var gatedAcc, out var reason))
+            {
+                SafetyLog?.Invoke($"[거부] {reason}");
+                throw new InvalidOperationException(reason);
+            }
+            if (!string.IsNullOrWhiteSpace(reason)) SafetyLog?.Invoke($"[보정] 축{index} {reason}");
 
             await Task.Run(() =>
             {
-                if (ignoreIsMoving && _channels[index].Status.IsMoving)
-                {
-                    // [완벽 해결]
-                    _channels[index].Stop(t => { });
-                    System.Threading.Thread.Sleep(50);
-                }
-
-                _channels[index].SetVelocityParams(safeVel, safeAcc);
-                _channels[index].SetMoveAbsolutePosition(targetPos);
+                _channels[index].SetVelocityParams(gatedVel, gatedAcc);
+                _channels[index].SetMoveAbsolutePosition(gatedPos);
                 _channels[index].MoveAbsolute(60000000);
 
-                if (index != 2) _channels[index].DisableDevice();
+                // [모듈: 구동 라이프사이클 안정화] 
+                // 채널 비활성화 코드를 완전 제거하여 연속적인 절대 좌표 이동 명령 하달 시 예외 발생을 차단합니다.
             });
         }
 
@@ -301,7 +378,8 @@ namespace nanomaxtest.Controllers
         {
             if (!IsConnected(index) || velocityPercentage == 0)
             {
-                StopImmediate(index);
+                // [모듈 수정: 기구부 기어 충격 방지] 조그 정지 시 감속 프로파일을 무시하는 StopImmediate 대신, 부드럽게 감속하여 기계적 충격을 없애는 StopProfiled(Action 전달) 적용
+                StopProfiled(index);
                 return;
             }
 

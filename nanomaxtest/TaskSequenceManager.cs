@@ -20,7 +20,6 @@ namespace nanomaxtest.Managers
 
         public volatile bool IsMacroRunning = false;
         public volatile bool IsArrayRunning = false;
-        public volatile bool IsMacroPaused = false; // [모듈: 일시중단 상태 추가]
         public int CurrentMacroIndex { get; set; } = -1; // 누락된 인덱스 추적 속성 추가
         public int CurrentLoopIndex { get; set; } = 1;
 
@@ -44,7 +43,6 @@ namespace nanomaxtest.Managers
         public event Action<string> NotificationRequested;
 
 
-        // [모듈: 원형/나선형 패턴 시퀀스 실행기] 아래 메서드를 클래스 내부에 통째로 추가하세요.
         // [모듈: 원형/나선형 패턴 시퀀스 실행기]
         public async Task RunCirclePatternAsync(double startX, double startY, double startZ, double diameter, double zDistPerTurn, double vXY_input, double vZ_input, int steps, int loops, bool zEnabled)
         {
@@ -62,6 +60,13 @@ namespace nanomaxtest.Managers
                     _deviceCtrl.MoveAbsoluteAsync(0, decimal.Round((decimal)(centerX + r), 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true),
                     _deviceCtrl.MoveAbsoluteAsync(1, decimal.Round((decimal)centerY, 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true)
                 );
+                bool enteredX = await _deviceCtrl.WaitUntilStoppedAsync(0, () => !IsMacroRunning);
+                bool enteredY = await _deviceCtrl.WaitUntilStoppedAsync(1, () => !IsMacroRunning);
+                if (!enteredX || !enteredY)
+                {
+                    completedNormally = false;
+                    return;
+                }
 
                 var trajectory = _engine.GenerateSimpleTrajectory(startX, startY, diameter, steps, loops);
                 double zStepDist = zDistPerTurn / steps;
@@ -69,7 +74,11 @@ namespace nanomaxtest.Managers
 
                 foreach (var pt in trajectory)
                 {
-                    if (!IsMacroRunning) break;
+                    if (!IsMacroRunning)
+                    {
+                        completedNormally = false;
+                        break;
+                    }
 
                     var qx = decimal.Round((decimal)pt.TargetX, 5, MidpointRounding.AwayFromZero);
                     var qy = decimal.Round((decimal)pt.TargetY, 5, MidpointRounding.AwayFromZero);
@@ -86,12 +95,21 @@ namespace nanomaxtest.Managers
                     }
 
                     await Task.WhenAll(taskX, taskY, taskZ);
+                    bool stepX = await _deviceCtrl.WaitUntilStoppedAsync(0, () => !IsMacroRunning);
+                    bool stepY = await _deviceCtrl.WaitUntilStoppedAsync(1, () => !IsMacroRunning);
+                    bool stepZ = !zEnabled || zDistPerTurn == 0 || await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsMacroRunning);
+                    if (!stepX || !stepY || !stepZ)
+                    {
+                        completedNormally = false;
+                        break;
+                    }
                     currentStep++;
                 }
 
                 if (zEnabled && zDistPerTurn != 0)
                 {
-                    await _deviceCtrl.WaitUntilStoppedAsync(2);
+                    bool finalZ = await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsMacroRunning);
+                    if (!finalZ) completedNormally = false;
                 }
 
             }
@@ -110,17 +128,11 @@ namespace nanomaxtest.Managers
 
         public void StopAll()
         {
-            IsMacroRunning = false; IsArrayRunning = false; IsMacroPaused = false;
+            IsMacroRunning = false; IsArrayRunning = false;
             CurrentMacroIndex = -1; CurrentLoopIndex = 1;
             foreach (var cmd in MacroSequence) cmd.HasRuntimeTarget = false; // 캐시 초기화
             // [모듈 수정: 장비 수명 보호 및 링깅(Ringing) 방지] 매크로 취소 시 관성에 의한 장비 무리를 막기 위해, 즉각 정지가 아닌 설정된 가속도 값에 맞춰 부드럽게 감속 정지하도록 수정
             for (int i = 0; i < 3; i++) _deviceCtrl.StopProfiled(i);
-        }
-
-        public void PauseMacro()
-        {
-            IsMacroRunning = false; IsMacroPaused = true;
-            for (int i = 0; i < 3; i++) _deviceCtrl.StopProfiled(i); // 감속 정지
         }
 
         // [모듈: 실시간 기판 기울기가 반영된 매크로 시퀀스 실행 루프]
@@ -130,26 +142,23 @@ namespace nanomaxtest.Managers
             bool completedNormally = true;
             CompletedTimeInCurrentLoop = 0;
             _macroSw.Restart();
+            foreach (var cmd in MacroSequence) cmd.HasRuntimeTarget = false;
 
-            // 보정 기준점 확보: 매크로 시작 시점의 XY 축 현재 좌표를 초기 변위 0점으로 설정
             // 보정 기준점 확보: 매크로 시작 시점의 XY 축 현재 좌표를 초기 변위 0점으로 설정
             decimal initialXY = applySlope ? _deviceCtrl.GetPosition(slopeAxis) : 0m;
-            int startLoop = IsMacroPaused ? CurrentLoopIndex : 1;
-            int startIdx = IsMacroPaused ? Math.Max(0, CurrentMacroIndex) : 0;
-            IsMacroPaused = false; // 재개 후 플래그 해제
 
-            for (int loopIndex = startLoop; loopIndex <= totalLoops; loopIndex++)
+            for (int loopIndex = 1; loopIndex <= totalLoops; loopIndex++)
             {
                 CurrentLoopIndex = loopIndex;
                 CompletedTimeInCurrentLoop = 0;
-                if (!IsMacroRunning) { IsMacroPaused = true; completedNormally = false; break; }
+                if (!IsMacroRunning) { completedNormally = false; break; }
 
                 List<Task> batchTasks = new List<Task>();
                 List<int> batchAxes = new List<int>();
 
-                for (int i = startIdx; i < MacroSequence.Count; i++)
+                for (int i = 0; i < MacroSequence.Count; i++)
                 {
-                    if (!IsMacroRunning) { IsMacroPaused = true; completedNormally = false; break; }
+                    if (!IsMacroRunning) { completedNormally = false; break; }
 
                     MacroCommand cmd = MacroSequence[i];
                     CurrentMacroIndex = i; // [모듈: 버그 수정] 현재 진행 인덱스를 갱신하여 UI 시간 표시 연동 복구
@@ -218,7 +227,7 @@ namespace nanomaxtest.Managers
                         }
 
                         // [모듈 수정: .NET 프레임워크 호환성 패치] Math.Clamp가 지원되지 않는 환경을 위해 Math.Max와 Min을 조합하여 동일한 페일세이프(0~4.0mm) 적용
-                        finalPos = Math.Max(0m, Math.Min(finalPos, 4.0m));
+                        finalPos = Math.Max(0m, Math.Min(finalPos, 8.0m));
                         moveTask = _deviceCtrl.MoveAbsoluteAsync(cmd.AxisId, finalPos, targetVel, Math.Max(targetVel * 10m, 0.1m), true);
                     }
 
@@ -243,14 +252,13 @@ namespace nanomaxtest.Managers
                             bool stopped = await _deviceCtrl.WaitUntilStoppedAsync(axis, () => !IsMacroRunning);
                             allStopped &= stopped;
                         }
-                        if (!allStopped) { completedNormally = false; IsMacroPaused = true; break; }
+                        if (!allStopped) { completedNormally = false; break; }
 
                         CompletedTimeInCurrentLoop += batchBilling;
                         batchTasks.Clear(); batchAxes.Clear();
                     }
 
                 }
-                startIdx = 0; // 다음 반복 루프는 처음(0)부터 시작
 
                 if (completedNormally && notifyEveryLoop && totalLoops > 1 && loopIndex < totalLoops)
                     NotificationRequested?.Invoke($"매크로 {loopIndex}/{totalLoops}회 반복 완료");
@@ -258,6 +266,8 @@ namespace nanomaxtest.Managers
 
             _macroSw.Stop();
             IsMacroRunning = false;
+            CurrentMacroIndex = -1;
+            CurrentLoopIndex = 1;
             if (completedNormally) NotificationRequested?.Invoke($"매크로 실행이 완료되었습니다. (총 {totalLoops}회)");
         }
 

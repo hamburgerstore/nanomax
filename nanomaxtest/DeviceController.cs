@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using Thorlabs.MotionControl.DeviceManagerCLI;
 using Thorlabs.MotionControl.Benchtop.StepperMotorCLI;
@@ -15,6 +16,14 @@ namespace nanomaxtest.Controllers
         private bool[] _simIsConnected = new bool[3];
         private decimal[] _simPositions = new decimal[3];
         private bool[] _simIsMoving = new bool[3];
+        private readonly object _simStateLock = new object();
+        private readonly CancellationTokenSource[] _simMoveCts = new CancellationTokenSource[3];
+        private readonly SemaphoreSlim[] _simMoveGate = new[]
+        {
+            new SemaphoreSlim(1, 1),
+            new SemaphoreSlim(1, 1),
+            new SemaphoreSlim(1, 1)
+        };
 
         private BenchtopStepperMotor _device;
         private StepperMotorChannel[] _channels = new StepperMotorChannel[3];
@@ -37,9 +46,9 @@ namespace nanomaxtest.Controllers
             gatedAcc = Quantize(targetAcc);
             reason = "";
 
-            if (gatedPos < 0m || gatedPos > 4.0m)
+            if (gatedPos < 0m || gatedPos > 8.0m)
             {
-                reason = $"축 {axis} 목표좌표 {gatedPos:F5}mm가 리밋(0~4mm)을 벗어남";
+                reason = $"축 {axis} 목표좌표 {gatedPos:F5}mm가 리밋(0~8mm)을 벗어남";
                 return false;
             }
 
@@ -109,82 +118,82 @@ namespace nanomaxtest.Controllers
 
             await Task.Run(() =>
             {
-            try
-            {
-                Disconnect();
-                System.Threading.Thread.Sleep(200); // 포트 반환 안정화 딜레이
-
-                if (string.IsNullOrEmpty(cleanSerial) || cleanSerial.Length < 2)
-                    throw new Exception("시리얼 번호가 유효하지 않습니다.");
-
-                string prefix = cleanSerial.Substring(0, 2);
-
-                if (prefix == "70")
+                try
                 {
-                    _device = BenchtopStepperMotor.CreateBenchtopStepperMotor(cleanSerial);
-                }
-                else if (prefix == "71")
-                {
-                    throw new Exception($"BPC 피에조 컨트롤러(접두사 71)가 감지되었습니다. 현재 팩토리는 스테퍼(BSC) 전용이므로 BenchtopPiezo 클래스 연동이 필요합니다.");
-                }
-                else
-                {
-                    throw new Exception($"시리얼 번호 접두사({prefix})는 현재 BenchtopStepperMotor 클래스와 호환되지 않습니다. 호환되는 Kinesis 드라이버 DLL을 확인하세요.");
-                }
+                    Disconnect();
+                    System.Threading.Thread.Sleep(200); // 포트 반환 안정화 딜레이
 
-                if (_device == null)
-                {
-                    throw new Exception($"장비({cleanSerial}) 인스턴스를 생성할 수 없습니다. Kinesis DLL 바인딩(x64/x86) 또는 장비 전원 상태를 확인하세요.");
-                }
+                    if (string.IsNullOrEmpty(cleanSerial) || cleanSerial.Length < 2)
+                        throw new Exception("시리얼 번호가 유효하지 않습니다.");
 
-                _device.Connect(cleanSerial);
-                System.Threading.Thread.Sleep(500);
+                    string prefix = cleanSerial.Substring(0, 2);
 
-                short[] targetChs = { 3, 2, 1 }; // 논리 인덱스 0(X)->CH3, 1(Y)->CH2, 2(Z)->CH1
-                for (int i = 0; i < 3; i++)
-                {
-                    StepperMotorChannel channel = null;
-                    // [모듈: 하드웨어 채널 매핑 보정] 물리 하드웨어 채널 순서를 소프트웨어의 직교 좌표계 인덱스에 강제 동기화합니다.
-                    short[] candidateIds = { targetChs[i], (short)(targetChs[i] - 1) };
-
-                    foreach (short id in candidateIds)
+                    if (prefix == "70")
                     {
-                        try
-                        {
-                            channel = _device.GetChannel(id);
-                            if (channel != null) break;
-                        }
-                        catch (NullReferenceException)
-                        {
-                            channel = null;
-                        }
-                        catch
-                        {
-                            channel = null;
-                        }
+                        _device = BenchtopStepperMotor.CreateBenchtopStepperMotor(cleanSerial);
+                    }
+                    else if (prefix == "71")
+                    {
+                        throw new Exception($"BPC 피에조 컨트롤러(접두사 71)가 감지되었습니다. 현재 팩토리는 스테퍼(BSC) 전용이므로 BenchtopPiezo 클래스 연동이 필요합니다.");
+                    }
+                    else
+                    {
+                        throw new Exception($"시리얼 번호 접두사({prefix})는 현재 BenchtopStepperMotor 클래스와 호환되지 않습니다. 호환되는 Kinesis 드라이버 DLL을 확인하세요.");
                     }
 
-                    if (channel == null)
+                    if (_device == null)
                     {
-                        throw new Exception($"모터 채널(축 {i + 1}) 인스턴스를 확보하지 못했습니다. 물리 슬롯 구성을 확인하세요.");
+                        throw new Exception($"장비({cleanSerial}) 인스턴스를 생성할 수 없습니다. Kinesis DLL 바인딩(x64/x86) 또는 장비 전원 상태를 확인하세요.");
                     }
 
-                    _channels[i] = channel;
+                    _device.Connect(cleanSerial);
+                    System.Threading.Thread.Sleep(500);
 
-                    // [모듈: 모터 구성 파라미터 로드 및 초기화]
-                    // SDK 내부 설정 안착을 위해 필수적인 LoadMotorConfiguration을 채널 ID 기반으로 호출합니다.
-                    _channels[i].LoadMotorConfiguration(_channels[i].DeviceID);
-
-                    if (!_channels[i].IsSettingsInitialized())
+                    short[] targetChs = { 3, 2, 1 }; // 논리 인덱스 0(X)->CH3, 1(Y)->CH2, 2(Z)->CH1
+                    for (int i = 0; i < 3; i++)
                     {
-                        _channels[i].WaitForSettingsInitialized(5000);
+                        StepperMotorChannel channel = null;
+                        // [모듈: 하드웨어 채널 매핑 보정] 물리 하드웨어 채널 순서를 소프트웨어의 직교 좌표계 인덱스에 강제 동기화합니다.
+                        short[] candidateIds = { targetChs[i], (short)(targetChs[i] - 1) };
+
+                        foreach (short id in candidateIds)
+                        {
+                            try
+                            {
+                                channel = _device.GetChannel(id);
+                                if (channel != null) break;
+                            }
+                            catch (NullReferenceException)
+                            {
+                                channel = null;
+                            }
+                            catch
+                            {
+                                channel = null;
+                            }
+                        }
+
+                        if (channel == null)
+                        {
+                            throw new Exception($"모터 채널(축 {i + 1}) 인스턴스를 확보하지 못했습니다. 물리 슬롯 구성을 확인하세요.");
+                        }
+
+                        _channels[i] = channel;
+
+                        // [모듈: 모터 구성 파라미터 로드 및 초기화]
+                        // SDK 내부 설정 안착을 위해 필수적인 LoadMotorConfiguration을 채널 ID 기반으로 호출합니다.
+                        _channels[i].LoadMotorConfiguration(_channels[i].DeviceID);
+
                         if (!_channels[i].IsSettingsInitialized())
                         {
-                            throw new Exception($"모터 채널(축 {i + 1})의 파라미터 초기화가 지연되고 있습니다.");
+                            _channels[i].WaitForSettingsInitialized(5000);
+                            if (!_channels[i].IsSettingsInitialized())
+                            {
+                                throw new Exception($"모터 채널(축 {i + 1})의 파라미터 초기화가 지연되고 있습니다.");
+                            }
                         }
-                    }
 
-                    System.Threading.Thread.Sleep(100);
+                        System.Threading.Thread.Sleep(100);
 
                         var deviceSettings = _channels[i].MotorDeviceSettings;
                         if (deviceSettings == null)
@@ -214,7 +223,17 @@ namespace nanomaxtest.Controllers
         {
             if (IsSimulationMode)
             {
-                for (int i = 0; i < 3; i++) _simIsConnected[i] = false;
+                for (int i = 0; i < 3; i++)
+                {
+                    _simIsConnected[i] = false;
+                    _simIsMoving[i] = false;
+                    lock (_simStateLock)
+                    {
+                        _simMoveCts[i]?.Cancel();
+                        _simMoveCts[i]?.Dispose();
+                        _simMoveCts[i] = null;
+                    }
+                }
                 return;
             }
 
@@ -231,11 +250,11 @@ namespace nanomaxtest.Controllers
             if (_device != null)
 
             {
-            _device.Disconnect(true);
-            _device = null;
+                _device.Disconnect(true);
+                _device = null;
             }
         }
-        
+
 
         public bool IsConnected(int index) => IsSimulationMode ? _simIsConnected[index] : (_channels[index] != null && _channels[index].IsConnected);
         public bool IsMoving(int index) => IsSimulationMode ? _simIsMoving[index] : (IsConnected(index) && _channels[index].Status.IsMoving);
@@ -311,7 +330,11 @@ namespace nanomaxtest.Controllers
         {
             if (IsConnected(index))
             {
-                if (IsSimulationMode) _simIsMoving[index] = false;
+                if (IsSimulationMode)
+                {
+                    _simIsMoving[index] = false;
+                    lock (_simStateLock) _simMoveCts[index]?.Cancel();
+                }
                 // [완벽 해결] SDK의 Action<ulong> 요구사항에 맞춰 빈 람다 함수 전달
                 else _channels[index].Stop(t => { });
             }
@@ -330,38 +353,73 @@ namespace nanomaxtest.Controllers
         {
             if (!IsConnected(index)) return;
             if (!ignoreIsMoving && IsMoving(index)) return;
-
-            if (IsSimulationMode)
-            {
-                _simIsMoving[index] = true;
-                decimal startPos = _simPositions[index];
-                decimal dist = Math.Abs(targetPos - startPos);
-                int delayMs = targetVel > 0 ? (int)((dist / targetVel) * 1000) : 0;
-
-                _ = Task.Run(async () =>
-                {
-                    int steps = delayMs / 50;
-                    if (steps > 0)
-                    {
-                        for (int i = 1; i <= steps; i++)
-                        {
-                            if (!_simIsMoving[index]) break;
-                            await Task.Delay(50);
-                            _simPositions[index] = startPos + (targetPos - startPos) * ((decimal)i / steps);
-                        }
-                    }
-                    if (_simIsMoving[index]) _simPositions[index] = targetPos;
-                    _simIsMoving[index] = false;
-                });
-                return;
-            }
-
             if (!TryApplySafetyGate(index, targetPos, targetVel, targetAcc, out var gatedPos, out var gatedVel, out var gatedAcc, out var reason))
             {
                 SafetyLog?.Invoke($"[거부] {reason}");
                 throw new InvalidOperationException(reason);
             }
             if (!string.IsNullOrWhiteSpace(reason)) SafetyLog?.Invoke($"[보정] 축{index} {reason}");
+
+            if (IsSimulationMode)
+            {
+                CancellationTokenSource localCts;
+                lock (_simStateLock)
+                {
+                    _simMoveCts[index]?.Cancel();
+                    _simMoveCts[index]?.Dispose();
+                    localCts = new CancellationTokenSource();
+                    _simMoveCts[index] = localCts;
+                }
+
+                await _simMoveGate[index].WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    bool superseded;
+                    lock (_simStateLock) superseded = !ReferenceEquals(_simMoveCts[index], localCts);
+                    if (superseded) return;
+
+                    _simIsMoving[index] = true;
+                    decimal startPos = _simPositions[index];
+                    decimal dist = Math.Abs(gatedPos - startPos);
+                    int delayMs = gatedVel > 0 ? (int)((dist / gatedVel) * 1000m) : 0;
+                    if (delayMs <= 0)
+                    {
+                        _simPositions[index] = gatedPos;
+                        return;
+                    }
+
+                    int steps = Math.Max(1, (int)Math.Ceiling(delayMs / 50.0));
+                    int stepDelay = Math.Max(1, delayMs / steps);
+                    for (int i = 1; i <= steps; i++)
+                    {
+                        bool keepRunning;
+                        lock (_simStateLock) keepRunning = ReferenceEquals(_simMoveCts[index], localCts);
+                        if (!keepRunning || !_simIsMoving[index]) break;
+
+                        await Task.Delay(stepDelay, localCts.Token).ConfigureAwait(false);
+                        _simPositions[index] = startPos + (gatedPos - startPos) * ((decimal)i / steps);
+                    }
+
+                    bool completeNormally;
+                    lock (_simStateLock) completeNormally = ReferenceEquals(_simMoveCts[index], localCts);
+                    if (completeNormally && _simIsMoving[index]) _simPositions[index] = gatedPos;
+                }
+                catch (OperationCanceledException) { }
+                finally
+                {
+                    lock (_simStateLock)
+                    {
+                        if (ReferenceEquals(_simMoveCts[index], localCts))
+                        {
+                            _simIsMoving[index] = false;
+                            _simMoveCts[index]?.Dispose();
+                            _simMoveCts[index] = null;
+                        }
+                    }
+                    _simMoveGate[index].Release();
+                }
+                return;
+            }
 
             await Task.Run(() =>
             {

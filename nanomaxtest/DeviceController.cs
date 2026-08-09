@@ -28,8 +28,17 @@ namespace nanomaxtest.Controllers
         private BenchtopStepperMotor _device;
         private StepperMotorChannel[] _channels = new StepperMotorChannel[3];
 
+        // 축별 이동 명령을 직렬화하여 동일 채널에 Move 명령이 중첩되는 것을 방지합니다.
+        private readonly SemaphoreSlim[] _hardwareMoveGate = new[]
+        {
+            new SemaphoreSlim(1, 1),
+            new SemaphoreSlim(1, 1),
+            new SemaphoreSlim(1, 1)
+        };
+
         private readonly object _safetyLock = new object();
         private readonly decimal[] _lastAcc = new decimal[3];
+
         private readonly DateTime[] _lastCmdAt = new DateTime[3];
         private readonly decimal[] _axisMaxVel = new decimal[] { 2.0m, 2.0m, 1.5m };
         private readonly decimal[] _axisMaxAcc = new decimal[] { 5.0m, 5.0m, 2.5m };
@@ -278,39 +287,59 @@ namespace nanomaxtest.Controllers
             }
         }
 
-        public async Task<bool> WaitUntilStoppedAsync(int index, Func<bool> checkCancel = null)
+        public async Task<bool> WaitUntilStoppedAsync(
+            int index,
+            Func<bool> checkCancel = null,
+            int timeoutMilliseconds = 30000)
         {
             if (!IsConnected(index)) return true;
 
             if (IsSimulationMode)
             {
+                DateTime simDeadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
+
                 while (_simIsMoving[index])
                 {
                     if (checkCancel != null && checkCancel()) return false;
-                    await Task.Delay(50);
+                    if (DateTime.UtcNow >= simDeadline)
+                        throw new TimeoutException($"축 {index} 정지 확인 시간이 초과되었습니다.");
+
+                    await Task.Delay(50).ConfigureAwait(false);
                 }
+
                 return true;
             }
 
-
+            DateTime deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
             int stopConfirmCount = 0;
+
             while (true)
             {
                 if (checkCancel != null && checkCancel()) return false;
+                if (!IsConnected(index)) return true;
 
-                if (!_channels[index].Status.IsMoving)
+                StepperMotorChannel channel = _channels[index];
+                if (channel == null) return true;
+
+                if (!channel.Status.IsMoving)
                 {
                     stopConfirmCount++;
-                    if (stopConfirmCount >= 3) break;
+                    if (stopConfirmCount >= 3) return true;
                 }
-                else stopConfirmCount = 0;
+                else
+                {
+                    stopConfirmCount = 0;
+                }
 
-                await Task.Delay(50);
+                if (DateTime.UtcNow >= deadline)
+                    throw new TimeoutException($"축 {index} 정지 확인 시간이 초과되었습니다.");
+
+                await Task.Delay(50).ConfigureAwait(false);
             }
-            return true;
         }
 
         public async Task HomeAsync(int index)
+
         {
             if (!IsConnected(index)) return;
 
@@ -326,17 +355,53 @@ namespace nanomaxtest.Controllers
             await Task.Run(() => _channels[index].Home(60000000));
         }
 
+        // 정지 완료 콜백과 하드웨어 상태 해제를 모두 확인한 후 반환합니다.
+        public async Task StopProfiledAsync(int index)
+        {
+            if (!IsConnected(index)) return;
+
+            if (IsSimulationMode)
+            {
+                _simIsMoving[index] = false;
+                lock (_simStateLock) _simMoveCts[index]?.Cancel();
+                await WaitUntilStoppedAsync(index, null, 30000).ConfigureAwait(false);
+                return;
+            }
+
+            StepperMotorChannel channel = _channels[index];
+            if (channel == null) return;
+
+            var stopCompleted = new TaskCompletionSource<bool>(
+                TaskCreationOptions.RunContinuationsAsynchronously);
+
+            channel.Stop(_ => stopCompleted.TrySetResult(true));
+
+            Task timeoutTask = Task.Delay(30000);
+            Task completedTask = await Task.WhenAny(
+                    stopCompleted.Task,
+                    timeoutTask)
+                .ConfigureAwait(false);
+
+            if (completedTask == timeoutTask)
+                throw new TimeoutException($"축 {index} 프로파일 정지 시간이 초과되었습니다.");
+
+            await stopCompleted.Task.ConfigureAwait(false);
+            await WaitUntilStoppedAsync(index, null, 30000).ConfigureAwait(false);
+        }
+
+        // 창 종료 등 완료 대기가 불가능한 경로를 위한 정지 요청 API입니다.
         public void StopProfiled(int index)
         {
-            if (IsConnected(index))
+            if (!IsConnected(index)) return;
+
+            if (IsSimulationMode)
             {
-                if (IsSimulationMode)
-                {
-                    _simIsMoving[index] = false;
-                    lock (_simStateLock) _simMoveCts[index]?.Cancel();
-                }
-                // [완벽 해결] SDK의 Action<ulong> 요구사항에 맞춰 빈 람다 함수 전달
-                else _channels[index].Stop(t => { });
+                _simIsMoving[index] = false;
+                lock (_simStateLock) _simMoveCts[index]?.Cancel();
+            }
+            else
+            {
+                _channels[index].Stop(_ => { });
             }
         }
 
@@ -349,13 +414,33 @@ namespace nanomaxtest.Controllers
             }
         }
 
+        // 비상 정지 명령 후 실제 Moving 상태가 해제될 때까지 기다립니다.
+        public async Task StopImmediateAsync(int index)
+        {
+            if (!IsConnected(index)) return;
+
+            if (IsSimulationMode)
+            {
+                _simIsMoving[index] = false;
+                lock (_simStateLock) _simMoveCts[index]?.Cancel();
+            }
+            else
+            {
+                _channels[index].StopImmediate();
+            }
+
+            await WaitUntilStoppedAsync(index, null, 10000).ConfigureAwait(false);
+        }
+
         public async Task MoveAbsoluteAsync(int index, decimal targetPos, decimal targetVel, decimal targetAcc, bool ignoreIsMoving = false)
         {
             if (!IsConnected(index)) return;
-            if (!ignoreIsMoving && IsMoving(index)) return;
+
+            // ignoreIsMoving은 호출부 호환성을 위해 유지하며 실제 이동 상태 우회에는 사용하지 않습니다.
             if (!TryApplySafetyGate(index, targetPos, targetVel, targetAcc, out var gatedPos, out var gatedVel, out var gatedAcc, out var reason))
             {
                 SafetyLog?.Invoke($"[거부] {reason}");
+
                 throw new InvalidOperationException(reason);
             }
             if (!string.IsNullOrWhiteSpace(reason)) SafetyLog?.Invoke($"[보정] 축{index} {reason}");
@@ -421,18 +506,45 @@ namespace nanomaxtest.Controllers
                 return;
             }
 
-            await Task.Run(() =>
+            // 이전 MoveAbsolute 호출이 반환된 뒤에만 같은 축의 다음 명령을 실행합니다.
+            await _hardwareMoveGate[index].WaitAsync().ConfigureAwait(false);
+            try
             {
-                _channels[index].SetVelocityParams(gatedVel, gatedAcc);
-                _channels[index].SetMoveAbsolutePosition(gatedPos);
-                _channels[index].MoveAbsolute(60000000);
+                if (!IsConnected(index)) return;
 
-                // [모듈: 구동 라이프사이클 안정화] 
-                // 채널 비활성화 코드를 완전 제거하여 연속적인 절대 좌표 이동 명령 하달 시 예외 발생을 차단합니다.
-            });
+                if (IsMoving(index))
+                {
+                    throw new InvalidOperationException(
+                        $"축 {index}이 아직 이동 또는 정지 처리 중입니다.");
+                }
+
+                StepperMotorChannel channel = _channels[index];
+                if (channel == null) return;
+
+                // [모듈: 모터 구동 블로킹 예외 캡슐화]
+                // 60000000ms 블로킹 대기 중 Stop 명령에 의해 발생하는 하드웨어 강제 중단 예외를 흡수하여 프로그램 크래시 방지
+                await Task.Run(() =>
+                {
+                    channel.SetVelocityParams(gatedVel, gatedAcc);
+                    channel.SetMoveAbsolutePosition(gatedPos);
+                    try
+                    {
+                        channel.MoveAbsolute(60000000);
+                    }
+                    catch (Exception)
+                    {
+                        // StopProfiledAsync 등 외부 개입으로 인한 이동 취소 시 예외 삼킴
+                    }
+                }).ConfigureAwait(false);
+            }
+            finally
+            {
+                _hardwareMoveGate[index].Release();
+            }
         }
 
         public void StartJog(int index, double velocityPercentage)
+
         {
             if (!IsConnected(index) || velocityPercentage == 0)
             {
@@ -447,12 +559,29 @@ namespace nanomaxtest.Controllers
                 return;
             }
 
-            decimal maxVel = 2.0m;
-            decimal jogVel = (decimal)(Math.Abs(velocityPercentage) / 100.0) * maxVel;
-            if (jogVel < 0.1m) jogVel = 0.1m;
+            // 이미 이동 중인 채널에는 MoveContinuous를 중복 전송하지 않습니다.
+            if (IsMoving(index)) return;
+            if (!_hardwareMoveGate[index].Wait(0)) return;
 
-            _channels[index].SetVelocityParams(jogVel, 1.0m);
-            _channels[index].MoveContinuous(velocityPercentage > 0 ? MotorDirection.Forward : MotorDirection.Backward);
+            try
+            {
+                decimal maxVel = 2.0m;
+                decimal jogVel = (decimal)(Math.Abs(velocityPercentage) / 100.0) * maxVel;
+                if (jogVel < 0.1m) jogVel = 0.1m;
+
+                StepperMotorChannel channel = _channels[index];
+                if (channel == null) return;
+
+                channel.SetVelocityParams(jogVel, 1.0m);
+                channel.MoveContinuous(
+                    velocityPercentage > 0
+                        ? MotorDirection.Forward
+                        : MotorDirection.Backward);
+            }
+            finally
+            {
+                _hardwareMoveGate[index].Release();
+            }
         }
     }
 }

@@ -79,6 +79,10 @@ namespace nanomaxtest.Models
         public double VelY { get; set; }
         public bool MoveX { get; set; }
         public bool MoveY { get; set; }
+        // [모듈: 3D 궤적 제어] Z축 목표 좌표, 속도 및 구동 플래그 추가
+        public double TargetZ { get; set; }
+        public double VelZ { get; set; }
+        public bool MoveZ { get; set; }
     }
 
     public class AngleMoveData

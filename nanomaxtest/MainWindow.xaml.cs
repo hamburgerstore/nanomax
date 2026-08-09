@@ -1,6 +1,7 @@
 ﻿using Microsoft.Win32;
 using nanomaxtest.Controllers;
 using nanomaxtest.Engines;
+using nanomaxtest.Managers;
 using nanomaxtest.Models;
 using System;
 using System.Collections.Generic;
@@ -110,47 +111,68 @@ namespace nanomaxtest
             ctrl.inAcc.LostFocus += TextBox_LostFocus;
             ctrl.inAcc.KeyDown += TextBox_KeyDown_Execute;
 
-            ctrl.btnHome.Click += (s, e) => _ = RunHomeAxis(axisIndex);
-            ctrl.btnStop.Click += (s, e) => StopAxis(axisIndex);
-            ctrl.btnPlus.Click += (s, e) => ExecuteMoveRelative(axisIndex, 1.0, ctrl.inTarget, ctrl.inVel, ctrl.inAcc);
-            ctrl.btnMinus.Click += (s, e) => ExecuteMoveRelative(axisIndex, -1.0, ctrl.inTarget, ctrl.inVel, ctrl.inAcc);
-            ctrl.btnGo.Click += (s, e) => ExecuteMoveAbsolute(axisIndex, ctrl.inTarget, ctrl.inVel, ctrl.inAcc);
-            ctrl.cmbMode.MouseRightButtonUp += (s, e) => { ctrl.cmbMode.SelectedIndex = ctrl.cmbMode.SelectedIndex == 0 ? 1 : 0; e.Handled = true; };
+            ctrl.btnHome.Click += async (s, e) =>
+                await RunHomeAxis(axisIndex);
 
-            ctrl.sliderJog.ValueChanged += (s, e) => HandleJog(axisIndex, ctrl.sliderJog);
-            ctrl.sliderJog.PreviewMouseLeftButtonUp += (s, e) => StopJog(axisIndex, ctrl.sliderJog);
+            ctrl.btnStop.Click += async (s, e) =>
+                await StopAxisAsync(axisIndex);
+
+            ctrl.btnPlus.Click += (s, e) =>
+                ExecuteMoveRelative(axisIndex, 1.0, ctrl.inTarget, ctrl.inVel, ctrl.inAcc);
+
+            ctrl.btnMinus.Click += (s, e) =>
+                ExecuteMoveRelative(axisIndex, -1.0, ctrl.inTarget, ctrl.inVel, ctrl.inAcc);
+
+            ctrl.btnGo.Click += (s, e) =>
+                ExecuteMoveAbsolute(axisIndex, ctrl.inTarget, ctrl.inVel, ctrl.inAcc);
+
+            ctrl.cmbMode.MouseRightButtonUp += (s, e) =>
+            {
+                ctrl.cmbMode.SelectedIndex =
+                    ctrl.cmbMode.SelectedIndex == 0 ? 1 : 0;
+                e.Handled = true;
+            };
+
+            ctrl.sliderJog.ValueChanged += (s, e) =>
+                HandleJog(axisIndex, ctrl.sliderJog);
+
+            ctrl.sliderJog.PreviewMouseLeftButtonUp += async (s, e) =>
+                await StopJogAsync(axisIndex, ctrl.sliderJog);
         }
 
         private void LoadSettings()
         {
-            try
+
             {
-                bool loaded = false;
-                if (File.Exists(_settingsFilePath))
+                try
                 {
-                    string[] lines = File.ReadAllLines(_settingsFilePath, Encoding.UTF8);
-                    foreach (string line in lines)
+                    bool loaded = false;
+                    if (File.Exists(_settingsFilePath))
                     {
-                        if (line.StartsWith("WebhookUrl="))
+                        string[] lines = File.ReadAllLines(_settingsFilePath, Encoding.UTF8);
+                        foreach (string line in lines)
                         {
-                            string val = line.Substring("WebhookUrl=".Length).Trim();
-                            if (!string.IsNullOrEmpty(val))
+                            if (line.StartsWith("WebhookUrl="))
                             {
-                                txtWebhookUrl.Text = val;
-                                loaded = true;
+                                string val = line.Substring("WebhookUrl=".Length).Trim();
+                                if (!string.IsNullOrEmpty(val))
+                                {
+                                    txtWebhookUrl.Text = val;
+                                    loaded = true;
+                                }
                             }
                         }
                     }
-                }
 
-                if (!loaded)
+                    if (!loaded)
+                    {
+                        txtWebhookUrl.Text = "";
+                    }
+                }
+                catch
                 {
                     txtWebhookUrl.Text = "";
                 }
-            }
-            catch
-            {
-                txtWebhookUrl.Text = "";
             }
         }
 
@@ -176,13 +198,24 @@ namespace nanomaxtest
 
             try
             {
-                _sequenceManager?.StopAll();
-                for (int i = 0; i < 3; i++) _deviceController?.StopProfiled(i);
+                // 전역 예외 경로에서는 비동기 완료를 기다리지 않고 즉시 정지를 요청합니다.
+                if (_sequenceManager != null)
+                {
+                    _sequenceManager.IsMacroRunning = false;
+                    _sequenceManager.IsArrayRunning = false;
+                }
+
+                if (_deviceController != null)
+                {
+                    for (int i = 0; i < 3; i++)
+                        _deviceController.StopImmediate(i);
+                }
             }
             catch { }
 
             Dispatcher.Invoke(() =>
             {
+
                 btnConnect.IsEnabled = false;
                 btnStartMacro.IsEnabled = false;
                 btnStartArray.IsEnabled = false;
@@ -566,13 +599,15 @@ namespace nanomaxtest
                 btnStop.IsEnabled = false;
             }
             txtTime.Text = axisMoving && (_timeRemaining[index] <= 0 || !_hasTargetTime[index])
-                ? "남은 시간: 정착 대기"
-                : $"남은 시간: {_timeRemaining[index]:F1}초";
+    ? "남은 시간: 정착 대기"
+    : $"남은 시간: {_timeRemaining[index]:F1}초";
         }
+
         private async Task<bool> WaitUntilStopped(int index)
-    => await _deviceController.WaitUntilStoppedAsync(index, () => !_sequenceManager.IsMacroRunning && !_sequenceManager.IsArrayRunning);
+            => await _deviceController.WaitUntilStoppedAsync(index);
 
         private async Task RunHomeAxis(int index)
+
 
         {
             LogAction($"UI CH {index + 1}", "Home 복귀 시도", "-", "-");
@@ -580,17 +615,21 @@ namespace nanomaxtest
             catch (Exception ex) { MessageBox.Show($"원점 복귀 실패:\n{ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Warning); }
         }
 
-        private void StopAxis(int index)
+        private async Task StopAxisAsync(int index)
         {
-            _deviceController.StopProfiled(index);
+            await _deviceController.StopProfiledAsync(index);
+
             _timeRemaining[index] = 0;
             _hasTargetTime[index] = false;
             if (_isRecording && _isDirectMoving[index]) _isInterrupted[index] = true;
-            _moveCommanded[index] = false; _isDirectMoving[index] = false;
+            _moveCommanded[index] = false;
+            _isDirectMoving[index] = false;
+
             LogAction($"UI CH {index + 1}", "안전 정지", "-", "-");
         }
 
         private async Task RunMoveRelative(int index, double dirMultiplier, double dist, double vel, double acc, bool isMacro = false)
+
         {
             if (!_deviceController.IsConnected(index)) return;
             await RunMoveAbsolute(index, (double)(_deviceController.GetPosition(index) + (decimal)(dist / _unitMultiplier) * (decimal)dirMultiplier) * _unitMultiplier, vel, acc, isMacro);
@@ -666,15 +705,17 @@ namespace nanomaxtest
             _deviceController.StartJog(index, slider.Value);
         }
 
-        private void StopJog(int index, Slider slider)
+        private async Task StopJogAsync(int index, Slider slider)
         {
             slider.Value = 0;
+            await _deviceController.StopProfiledAsync(index);
             _hasTargetTime[index] = false;
-            _deviceController.StopProfiled(index);
+
             LogAction($"UI CH {index + 1}", "조그 이동 종료", "-", "-");
         }
 
         private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
+
         {
             if (chkEnableNudge?.IsChecked != true || _sequenceManager.IsMacroRunning || _sequenceManager.IsArrayRunning || e.OriginalSource is TextBox) return;
             int axis = -1; double dir = 0;
@@ -879,14 +920,20 @@ namespace nanomaxtest
             }
             catch (Exception ex)
             {
-                _sequenceManager.StopAll();
+                await _sequenceManager.StopAllAsync();
+
                 txtMacroStatus.Text = "원/나선 실행 중 오류로 정지됨";
                 txtMacroStatus.Foreground = Brushes.Red;
-                MessageBox.Show($"원/나선 실행 중 오류가 발생하여 긴급 정지했습니다.\n{ex.Message}", "비상 정지", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show(
+                    $"원/나선 실행 중 오류가 발생하여 긴급 정지했습니다.\n{ex.Message}",
+                    "비상 정지",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
             }
             finally
             {
                 btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
+
                 btnDrawCircle.IsEnabled = true;
                 btnStopMacro.IsEnabled = false;
             }
@@ -943,11 +990,12 @@ namespace nanomaxtest
                 }
                 catch (Exception ex)
                 {
-                    _sequenceManager.StopAll();
+                    await _sequenceManager.StopAllAsync();
                     MessageBox.Show($"매크로 실행 중 오류가 발생하여 긴급 정지했습니다.\n{ex.Message}", "비상 정지", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
 
                 btnStartMacro.IsEnabled = true; btnStopMacro.IsEnabled = false;
+
                 if (btnMainStartMacro != null) btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
                 if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = false;
 
@@ -962,22 +1010,70 @@ namespace nanomaxtest
         }
 
 
-        private void btnStopMacro_Click(object sender, RoutedEventArgs e)
+        private async void btnStopMacro_Click(object sender, RoutedEventArgs e)
         {
-            _sequenceManager.StopAll();
-            txtMacroStatus.Text = "강제 정지됨"; txtMacroStatus.Foreground = Brushes.Red;
-            btnStartMacro.Content = "매크로 시작"; btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; btnStopMacro.IsEnabled = false; btnDrawCircle.IsEnabled = true;
-            if (btnMainStartMacro != null) { btnMainStartMacro.Content = "▶ 매크로 실행"; btnMainStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0; }
+            btnStartMacro.IsEnabled = false;
+            btnStopMacro.IsEnabled = false;
+            btnDrawCircle.IsEnabled = false;
+            if (btnMainStartMacro != null) btnMainStartMacro.IsEnabled = false;
             if (btnMainStopMacro != null) btnMainStopMacro.IsEnabled = false;
-            UpdateTotalRemainingTime(0);
+
+            txtMacroStatus.Text = "정지 처리 중...";
+            txtMacroStatus.Foreground = Brushes.Orange;
+
+            try
+            {
+                await _sequenceManager.StopAllAsync();
+
+                txtMacroStatus.Text = "강제 정지됨";
+                txtMacroStatus.Foreground = Brushes.Red;
+            }
+            catch (Exception ex)
+            {
+                txtMacroStatus.Text = "정지 실패";
+                txtMacroStatus.Foreground = Brushes.Red;
+                MessageBox.Show(
+                    $"매크로 정지 중 오류가 발생했습니다.\n{ex.Message}",
+                    "정지 오류",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
+            finally
+            {
+                btnStartMacro.Content = "매크로 시작";
+                btnStartMacro.IsEnabled = _sequenceManager.MacroSequence.Count > 0;
+                btnDrawCircle.IsEnabled = true;
+
+                if (btnMainStartMacro != null)
+                {
+                    btnMainStartMacro.Content = "▶ 매크로 실행";
+                    btnMainStartMacro.IsEnabled =
+                        _sequenceManager.MacroSequence.Count > 0;
+                }
+
+                UpdateTotalRemainingTime(0);
+            }
         }
 
-        private void btnPauseMacro_Click(object sender, RoutedEventArgs e)
+        private async void btnPauseMacro_Click(object sender, RoutedEventArgs e)
         {
-            btnStopMacro_Click(sender, e);
+            btnPauseMacro.IsEnabled = false;
+            try
+            {
+                await _sequenceManager.StopAllAsync();
+                txtMacroStatus.Text = "일시정지됨";
+                txtMacroStatus.Foreground = Brushes.Red;
+            }
+            finally
+            {
+                btnPauseMacro.IsEnabled = true;
+                btnStartMacro.IsEnabled =
+                    _sequenceManager.MacroSequence.Count > 0;
+            }
         }
 
         private void LoadPresets() { cmbArrayPresets.Items.Clear(); foreach (var name in _presetManager.GetPresetNames()) cmbArrayPresets.Items.Add(name); }
+
 
         private void btnSavePreset_Click(object sender, RoutedEventArgs e)
         {
@@ -1073,11 +1169,12 @@ namespace nanomaxtest
             }
             catch (Exception ex)
             {
-                btnStopArray_Click(null, null);
+                await _sequenceManager.StopAllAsync();
                 MessageBox.Show($"어레이 구동 중 오류가 발생했습니다.\n{ex.Message}", "비상 정지", MessageBoxButton.OK, MessageBoxImage.Error);
             }
 
             btnStartArray.IsEnabled = true; btnExportArray.IsEnabled = true; btnStopArray.IsEnabled = false;
+
             txtArrayStatus.Text = "완료 (또는 정지됨)"; txtArrayStatus.Foreground = Brushes.Black;
         }
 
@@ -1085,20 +1182,46 @@ namespace nanomaxtest
         {
             var p = GetArrayParams(); if (p == null) return;
             double slopePerStep = _engine.CalculateArraySlope(_sequenceManager.ArrayPoints, p.Value.gDist, cmbArrayGapDir.SelectedIndex);
-            _fileManager.ExportArrayMacroCsv(p.Value.loops, p.Value.pDist, p.Value.pVel, p.Value.gDist, p.Value.gVel, p.Value.dVel, slopePerStep, cmbArrayAxis.SelectedIndex == 0 ? "X" : "Y", cmbArrayGapDir.SelectedIndex == 0 ? 1.0 : -1.0);
-        }
+    _fileManager.ExportArrayMacroCsv(p.Value.loops, p.Value.pDist, p.Value.pVel, p.Value.gDist, p.Value.gVel, p.Value.dVel, slopePerStep, cmbArrayAxis.SelectedIndex == 0 ? "X" : "Y", cmbArrayGapDir.SelectedIndex == 0 ? 1.0 : -1.0);
+}
 
-        private void btnStopArray_Click(object sender, RoutedEventArgs e)
-        {
-            _sequenceManager.IsArrayRunning = false;
-            for (int i = 0; i < 3; i++) StopAxis(i);
-            txtArrayStatus.Text = "비상 정지됨!"; txtArrayStatus.Foreground = Brushes.Red;
-            btnStartArray.IsEnabled = true; btnExportArray.IsEnabled = true; btnStopArray.IsEnabled = false;
-        }
+private async void btnStopArray_Click(object sender, RoutedEventArgs e)
+{
+    btnStartArray.IsEnabled = false;
+    btnExportArray.IsEnabled = false;
+    btnStopArray.IsEnabled = false;
 
-        private void btnSubmitFeedback_Click(object sender, RoutedEventArgs e)
-        {
-            if (string.IsNullOrWhiteSpace(txtName.Text) || string.IsNullOrWhiteSpace(txtFeedback.Text)) return;
+    txtArrayStatus.Text = "정지 처리 중...";
+    txtArrayStatus.Foreground = Brushes.Orange;
+
+    try
+    {
+        await _sequenceManager.StopAllAsync();
+
+        txtArrayStatus.Text = "비상 정지됨!";
+        txtArrayStatus.Foreground = Brushes.Red;
+    }
+    catch (Exception ex)
+    {
+        txtArrayStatus.Text = "정지 실패";
+        txtArrayStatus.Foreground = Brushes.Red;
+        MessageBox.Show(
+            $"어레이 정지 중 오류가 발생했습니다.\n{ex.Message}",
+            "정지 오류",
+            MessageBoxButton.OK,
+            MessageBoxImage.Error);
+    }
+    finally
+    {
+        btnStartArray.IsEnabled = true;
+        btnExportArray.IsEnabled = true;
+    }
+}
+
+private void btnSubmitFeedback_Click(object sender, RoutedEventArgs e)
+
+{
+    if (string.IsNullOrWhiteSpace(txtName.Text) || string.IsNullOrWhiteSpace(txtFeedback.Text)) return;
             try { _fileManager.SaveFeedback(_appDataPath, txtName.Text, txtFeedback.Text); txtFeedback.Clear(); txtName.Clear(); MessageBox.Show("저장 완료"); } catch { }
         }
 
@@ -1151,16 +1274,39 @@ namespace nanomaxtest
             }
             catch (Exception ex) { MessageBox.Show($"저장 실패: {ex.Message}", "오류", MessageBoxButton.OK, MessageBoxImage.Error); }
         }
+
         protected override void OnClosed(EventArgs e)
         {
             try
             {
-                SaveSettings(); _uiTimer?.Stop();
-                if (_sequenceManager != null) { _sequenceManager.NotificationRequested -= SendNotification; _sequenceManager.StopAll(); }
-                _deviceController?.Disconnect();
+                SaveSettings();
+                _uiTimer?.Stop();
+
+                if (_sequenceManager != null)
+                {
+                    _sequenceManager.IsMacroRunning = false;
+                    _sequenceManager.IsArrayRunning = false;
+                    _sequenceManager.NotificationRequested -= SendNotification;
+                }
+
+                // 종료 경로에서는 즉시 정지 요청 후 장치 연결을 해제합니다.
+                if (_deviceController != null)
+                {
+                    for (int i = 0; i < 3; i++)
+                        _deviceController.StopImmediate(i);
+
+                    _deviceController.Disconnect();
+                }
             }
-            catch { }
-            finally { base.OnClosed(e); }
+            catch
+            {
+                // 종료 중 장치가 이미 해제된 경우의 SDK 예외는 무시합니다.
+            }
+            finally
+            {
+                base.OnClosed(e);
+            }
         }
     }
 }
+

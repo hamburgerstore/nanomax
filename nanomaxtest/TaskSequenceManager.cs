@@ -55,22 +55,27 @@ namespace nanomaxtest.Managers
                 double centerX = startX - r;
                 double centerY = startY;
 
-                // 루프 시작 전에 θ=0 진입점을 명시적으로 먼저 맞춤
                 await Task.WhenAll(
-                    _deviceCtrl.MoveAbsoluteAsync(0, decimal.Round((decimal)(centerX + r), 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true),
-                    _deviceCtrl.MoveAbsoluteAsync(1, decimal.Round((decimal)centerY, 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true)
+                    _deviceCtrl.MoveAbsoluteAsync(0, decimal.Round((decimal)(centerX + r), 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m)),
+                    _deviceCtrl.MoveAbsoluteAsync(1, decimal.Round((decimal)centerY, 5), (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m))
                 );
+
                 bool enteredX = await _deviceCtrl.WaitUntilStoppedAsync(0, () => !IsMacroRunning);
                 bool enteredY = await _deviceCtrl.WaitUntilStoppedAsync(1, () => !IsMacroRunning);
+
                 if (!enteredX || !enteredY)
                 {
                     completedNormally = false;
                     return;
                 }
 
-                var trajectory = _engine.GenerateSimpleTrajectory(startX, startY, diameter, steps, loops);
-                double zStepDist = zDistPerTurn / steps;
-                int currentStep = 1;
+                // [모듈: 현재 위치 추적 변수 초기화] 궤적 보간 연산을 위해 초기 좌표를 캐싱합니다.
+                decimal currentX = decimal.Round((decimal)(centerX + r), 5);
+                decimal currentY = decimal.Round((decimal)centerY, 5);
+                decimal currentZ = decimal.Round((decimal)startZ, 5);
+
+                // [모듈: 3D 헬릭스 궤적 적용] 엔진에서 완전한 3D 좌표 배열을 반환받아 루프 내 연산을 제거합니다.
+                var trajectory = _engine.GenerateHelixTrajectory(startX, startY, startZ, diameter, zDistPerTurn, steps, loops);
 
                 foreach (var pt in trajectory)
                 {
@@ -83,35 +88,62 @@ namespace nanomaxtest.Managers
                     var qx = decimal.Round((decimal)pt.TargetX, 5, MidpointRounding.AwayFromZero);
                     var qy = decimal.Round((decimal)pt.TargetY, 5, MidpointRounding.AwayFromZero);
 
-                    Task taskX = _deviceCtrl.MoveAbsoluteAsync(0, qx, (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true);
-                    Task taskY = _deviceCtrl.MoveAbsoluteAsync(1, qy, (decimal)vXY_input, Math.Max((decimal)vXY_input * 20m, 5.0m), true);
+                    // XY 좌표 하드웨어 리밋 보호 추가
+                    qx = Math.Max(0m, Math.Min(qx, 8.0m));
+                    qy = Math.Max(0m, Math.Min(qy, 8.0m));
+                    decimal qz = currentZ;
+
+                    // [모듈: 3D 직선 보간 연산] 각 축이 동시에 목표점에 도달하도록 이동 거리에 비례하여 축별 동기화 속도를 산출합니다.
+                    if (zEnabled && zDistPerTurn != 0)
+                        qz = Math.Max(0m, Math.Min(decimal.Round((decimal)pt.TargetZ, 5, MidpointRounding.AwayFromZero), 8.0m));
+
+                    double dx = (double)(qx - currentX);
+                    double dy = (double)(qy - currentY);
+                    double dz = (double)(qz - currentZ);
+
+                    double dist3D = Math.Sqrt(dx * dx + dy * dy + dz * dz);
+                    double estimatedTime = dist3D / vXY_input; // vXY_input을 3D 궤적의 목표 합성 속도로 기준 삼음
+
+                    decimal vx = estimatedTime > 0 ? (decimal)(Math.Abs(dx) / estimatedTime) : (decimal)vXY_input;
+                    decimal vy = estimatedTime > 0 ? (decimal)(Math.Abs(dy) / estimatedTime) : (decimal)vXY_input;
+                    decimal vz = estimatedTime > 0 ? (decimal)(Math.Abs(dz) / estimatedTime) : (decimal)vZ_input;
+
+                    Task taskX = _deviceCtrl.MoveAbsoluteAsync(0, qx, Math.Max(0.0001m, vx), Math.Max(vx * 20m, 5.0m));
+                    Task taskY = _deviceCtrl.MoveAbsoluteAsync(1, qy, Math.Max(0.0001m, vy), Math.Max(vy * 20m, 5.0m));
                     Task taskZ = Task.CompletedTask;
 
                     if (zEnabled && zDistPerTurn != 0)
                     {
-                        double targetZ = startZ + (zStepDist * currentStep);
-                        var qz = decimal.Round((decimal)targetZ, 5, MidpointRounding.AwayFromZero);
-                        taskZ = _deviceCtrl.MoveAbsoluteAsync(2, qz, (decimal)vZ_input, Math.Max((decimal)vZ_input * 20m, 5.0m), true);
+                        taskZ = _deviceCtrl.MoveAbsoluteAsync(2, qz, Math.Max(0.0001m, vz), Math.Max(vz * 20m, 5.0m));
                     }
 
                     await Task.WhenAll(taskX, taskY, taskZ);
                     bool stepX = await _deviceCtrl.WaitUntilStoppedAsync(0, () => !IsMacroRunning);
                     bool stepY = await _deviceCtrl.WaitUntilStoppedAsync(1, () => !IsMacroRunning);
                     bool stepZ = !zEnabled || zDistPerTurn == 0 || await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsMacroRunning);
+
                     if (!stepX || !stepY || !stepZ)
                     {
                         completedNormally = false;
                         break;
                     }
-                    currentStep++;
+
+                    // [모듈: 현재 위치 갱신] 다음 스텝의 직선 보간 거리 계산을 위해 현재 좌표 상태를 갱신합니다.
+                    currentX = qx;
+                    currentY = qy;
+                    currentZ = qz;
                 }
 
-                if (zEnabled && zDistPerTurn != 0)
+                if (zEnabled && zDistPerTurn != 0 && completedNormally)
                 {
                     bool finalZ = await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsMacroRunning);
                     if (!finalZ) completedNormally = false;
                 }
-
+            }
+            catch (Exception)
+            {
+                // 강제 중단 시 발생하는 비동기 통신 예외를 삼켜 프로그램 Freezing 방지
+                completedNormally = false;
             }
             finally
             {
@@ -126,13 +158,22 @@ namespace nanomaxtest.Managers
             _engine = engine;
         }
 
-        public void StopAll()
+        // 모든 축의 프로파일 정지가 완료된 뒤에만 제어권을 반환합니다.
+        public async Task StopAllAsync()
         {
-            IsMacroRunning = false; IsArrayRunning = false;
-            CurrentMacroIndex = -1; CurrentLoopIndex = 1;
-            foreach (var cmd in MacroSequence) cmd.HasRuntimeTarget = false; // 캐시 초기화
-            // [모듈 수정: 장비 수명 보호 및 링깅(Ringing) 방지] 매크로 취소 시 관성에 의한 장비 무리를 막기 위해, 즉각 정지가 아닌 설정된 가속도 값에 맞춰 부드럽게 감속 정지하도록 수정
-            for (int i = 0; i < 3; i++) _deviceCtrl.StopProfiled(i);
+            IsMacroRunning = false;
+            IsArrayRunning = false;
+
+            Task[] stopTasks = new Task[3];
+            for (int i = 0; i < 3; i++)
+                stopTasks[i] = _deviceCtrl.StopProfiledAsync(i);
+
+            await Task.WhenAll(stopTasks).ConfigureAwait(false);
+
+            CurrentMacroIndex = -1;
+            CurrentLoopIndex = 1;
+            foreach (var cmd in MacroSequence)
+                cmd.HasRuntimeTarget = false;
         }
 
         // [모듈: 실시간 기판 기울기가 반영된 매크로 시퀀스 실행 루프]
@@ -183,9 +224,19 @@ namespace nanomaxtest.Managers
                     }
                     else
                     {
+                        // 동일 동기 배치에서 같은 축을 두 번 이동시키는 명령은 허용하지 않습니다.
+                        if (batchAxes.Contains(cmd.AxisId))
+                        {
+                            throw new InvalidOperationException(
+                                $"매크로 {i + 1}번 명령: 동일 동기 배치에 " +
+                                $"{cmd.AxisName}축 명령이 중복되었습니다. " +
+                                $"앞 명령의 동시실행 설정을 해제하십시오.");
+                        }
+
                         // [모듈: 매크로 이동 시간 동적 카운트다운] 
                         // 일반 구동 모델 역시 크로스 스레드 갱신 오류를 방지하기 위해 일관된 디스패치 구조로 캡슐화합니다.
                         _ = Task.Run(async () => {
+
                             DateTime end = DateTime.Now.AddSeconds(cmd.EstimatedTime);
                             while (DateTime.Now < end && IsMacroRunning && _deviceCtrl.IsMoving(cmd.AxisId))
                             {
@@ -228,11 +279,16 @@ namespace nanomaxtest.Managers
 
                         // [모듈 수정: .NET 프레임워크 호환성 패치] Math.Clamp가 지원되지 않는 환경을 위해 Math.Max와 Min을 조합하여 동일한 페일세이프(0~4.0mm) 적용
                         finalPos = Math.Max(0m, Math.Min(finalPos, 8.0m));
-                        moveTask = _deviceCtrl.MoveAbsoluteAsync(cmd.AxisId, finalPos, targetVel, Math.Max(targetVel * 10m, 0.1m), true);
+                        moveTask = _deviceCtrl.MoveAbsoluteAsync(
+                            cmd.AxisId,
+                            finalPos,
+                            targetVel,
+                            Math.Max(targetVel * 10m, 0.1m));
                     }
 
                     batchTasks.Add(moveTask);
                     if (cmd.AxisName != "WAIT" && !batchAxes.Contains(cmd.AxisId)) batchAxes.Add(cmd.AxisId);
+
 
                     if (!cmd.IsSync || i == MacroSequence.Count - 1)
                     {
@@ -273,56 +329,163 @@ namespace nanomaxtest.Managers
 
 
         // [모듈: 어레이 프린팅 시퀀스 루프]
-        public async Task RunArrayPrintingAsync(int loops, double printDist, double printVel, double gapDist, double gapVel, double downVel, double slopePerStep, int gapAxis, double gapDir, bool notifyEveryLoop)
+        public async Task RunArrayPrintingAsync(
+            int loops,
+            double printDist,
+            double printVel,
+            double gapDist,
+            double gapVel,
+            double downVel,
+            double slopePerStep,
+            int gapAxis,
+            double gapDir,
+            bool notifyEveryLoop)
         {
             IsArrayRunning = true;
             bool completedNormally = true;
 
-            for (int i = 0; i < loops; i++)
+            try
             {
-                if (!IsArrayRunning) { completedNormally = false; break; }
-
-                decimal currentZ = _deviceCtrl.GetPosition(2);
-                await _deviceCtrl.MoveAbsoluteAsync(2, currentZ - (decimal)printDist, (decimal)printVel, 1m, true);
-                await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsArrayRunning);
-                await Task.Delay(100);
-
-                if (!IsArrayRunning) { completedNormally = false; break; }
-                currentZ = _deviceCtrl.GetPosition(2);
-                await _deviceCtrl.MoveAbsoluteAsync(2, currentZ - (decimal)printDist, 1m, 1m, true);
-                await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsArrayRunning);
-                await Task.Delay(100);
-
-                if (i < loops - 1)
+                for (int i = 0; i < loops; i++)
                 {
-                    if (!IsArrayRunning) { completedNormally = false; break; }
-                    decimal currentGapPos = _deviceCtrl.GetPosition(gapAxis);
-                    await _deviceCtrl.MoveAbsoluteAsync(gapAxis, currentGapPos + (decimal)(gapDist * gapDir), (decimal)gapVel, 1m, true);
-                    await _deviceCtrl.WaitUntilStoppedAsync(gapAxis, () => !IsArrayRunning);
+                    if (!IsArrayRunning)
+                    {
+                        completedNormally = false;
+                        break;
+                    }
+
+                    decimal currentZ = _deviceCtrl.GetPosition(2);
+                    await _deviceCtrl.MoveAbsoluteAsync(
+                        2,
+                        currentZ - (decimal)printDist,
+                        (decimal)printVel,
+                        1m);
+
+                    if (!await _deviceCtrl.WaitUntilStoppedAsync(
+                            2, () => !IsArrayRunning))
+                    {
+                        completedNormally = false;
+                        break;
+                    }
+
                     await Task.Delay(100);
 
-                    if (slopePerStep != 0)
+                    if (!IsArrayRunning)
                     {
-                        if (!IsArrayRunning) { completedNormally = false; break; }
+                        completedNormally = false;
+                        break;
+                    }
+
+                    currentZ = _deviceCtrl.GetPosition(2);
+                    await _deviceCtrl.MoveAbsoluteAsync(
+                        2,
+                        currentZ - (decimal)printDist,
+                        1m,
+                        1m);
+
+                    if (!await _deviceCtrl.WaitUntilStoppedAsync(
+                            2, () => !IsArrayRunning))
+                    {
+                        completedNormally = false;
+                        break;
+                    }
+
+                    await Task.Delay(100);
+
+                    if (i < loops - 1)
+                    {
+                        if (!IsArrayRunning)
+                        {
+                            completedNormally = false;
+                            break;
+                        }
+
+                        decimal currentGapPos =
+                            _deviceCtrl.GetPosition(gapAxis);
+
+                        await _deviceCtrl.MoveAbsoluteAsync(
+                            gapAxis,
+                            currentGapPos +
+                                (decimal)(gapDist * gapDir),
+                            (decimal)gapVel,
+                            1m);
+
+                        if (!await _deviceCtrl.WaitUntilStoppedAsync(
+                                gapAxis, () => !IsArrayRunning))
+                        {
+                            completedNormally = false;
+                            break;
+                        }
+
+                        await Task.Delay(100);
+
+                        if (slopePerStep != 0)
+                        {
+                            if (!IsArrayRunning)
+                            {
+                                completedNormally = false;
+                                break;
+                            }
+
+                            currentZ = _deviceCtrl.GetPosition(2);
+
+                            await _deviceCtrl.MoveAbsoluteAsync(
+                                2,
+                                currentZ + (decimal)slopePerStep,
+                                0.1m,
+                                1m);
+
+                            if (!await _deviceCtrl.WaitUntilStoppedAsync(
+                                    2, () => !IsArrayRunning))
+                            {
+                                completedNormally = false;
+                                break;
+                            }
+
+                            await Task.Delay(100);
+                        }
+
+                        if (!IsArrayRunning)
+                        {
+                            completedNormally = false;
+                            break;
+                        }
+
                         currentZ = _deviceCtrl.GetPosition(2);
-                        double slopeDir = slopePerStep > 0 ? 1.0 : -1.0;
-                        await _deviceCtrl.MoveAbsoluteAsync(2, currentZ + (decimal)(Math.Abs(slopePerStep) * slopeDir), 0.1m, 1m, true);
-                        await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsArrayRunning);
+                        await _deviceCtrl.MoveAbsoluteAsync(
+                            2,
+                            currentZ + (decimal)(printDist * 2),
+                            (decimal)downVel,
+                            1m);
+
+                        if (!await _deviceCtrl.WaitUntilStoppedAsync(
+                                2, () => !IsArrayRunning))
+                        {
+                            completedNormally = false;
+                            break;
+                        }
+
                         await Task.Delay(100);
                     }
 
-                    if (!IsArrayRunning) { completedNormally = false; break; }
-                    currentZ = _deviceCtrl.GetPosition(2);
-                    await _deviceCtrl.MoveAbsoluteAsync(2, currentZ + (decimal)(printDist * 2), (decimal)downVel, 1m, true);
-                    await _deviceCtrl.WaitUntilStoppedAsync(2, () => !IsArrayRunning);
-                    await Task.Delay(100);
+                    if (notifyEveryLoop && loops > 1)
+                    {
+                        NotificationRequested?.Invoke(
+                            $"어레이 {i + 1}/{loops}번째 기둥 완성");
+                    }
                 }
 
-                if (notifyEveryLoop && loops > 1) NotificationRequested?.Invoke($"어레이 {i + 1}/{loops}번째 기둥 완성");
+                if (completedNormally)
+                {
+                    NotificationRequested?.Invoke(
+                        $"어레이 작업이 최종 완료되었습니다. (총 {loops}개)");
+                }
             }
-
-            IsArrayRunning = false;
-            if (completedNormally) NotificationRequested?.Invoke($"어레이 작업이 최종 완료되었습니다. (총 {loops}개)");
+            finally
+            {
+                IsArrayRunning = false;
+            }
         }
     }
 }
+

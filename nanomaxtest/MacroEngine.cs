@@ -48,8 +48,36 @@ namespace nanomaxtest.Engines
             return trajectory;
         }
 
-        // [모듈: 어레이 프린팅 기울기 도출 (최소제곱법)]
+        // [모듈: 3D 헬릭스 궤적 연산] 
+        // 팁 파손을 방지하는 Z축 하강 벡터(음수 강제)를 포함하여 3차원 나선형 좌표를 일괄 산출합니다.
+        public List<TrajectoryPoint> GenerateHelixTrajectory(double approachX, double approachY, double startZ, double diameter, double zDistPerTurn, int steps, int loops)
+        {
+            var trajectory = new List<TrajectoryPoint>();
+            if (steps < 4 || loops < 1 || diameter <= 0) return trajectory;
 
+            double r = diameter / 2.0;
+            double centerX = approachX - r;
+            double actualZDistPerTurn = -Math.Abs(zDistPerTurn);
+            double zStep = actualZDistPerTurn / steps;
+
+            for (int lp = 0; lp < loops; lp++)
+            {
+                for (int s = 1; s <= steps; s++)
+                {
+                    double theta = (2.0 * Math.PI * s / steps) + (2.0 * Math.PI * lp);
+                    trajectory.Add(new TrajectoryPoint
+                    {
+                        TargetX = centerX + r * Math.Cos(theta),
+                        TargetY = approachY + r * Math.Sin(theta),
+                        TargetZ = startZ + zStep * (s + lp * steps),
+                        MoveX = true,
+                        MoveY = true,
+                        MoveZ = true
+                    });
+                }
+            }
+            return trajectory;
+        }
 
         // [모듈: 어레이 프린팅 기울기 도출 (최소제곱법)]
         public double CalculateArraySlope(IEnumerable<ArrayPoint> points, double gapDist, int gapDirIndex)
